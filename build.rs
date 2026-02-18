@@ -13,6 +13,7 @@ fn main() {
         "java/ScanCallback.java",
         "java/BroadcastReceiver.java",
     ];
+    let prebuilt_dex = "java/classes.dex";
 
     let out_dir: PathBuf = env::var_os("OUT_DIR").unwrap().into();
     let out_class_dir = out_dir.join("java");
@@ -23,7 +24,14 @@ fn main() {
     std::fs::create_dir_all(&out_class_dir)
         .unwrap_or_else(|e| panic!("Cannot create output directory {out_class_dir:?} - {e}"));
 
-    let android_jar = android_build::android_jar(None).expect("No Android platforms found");
+    let Some(android_jar) = android_build::android_jar(None) else {
+        println!(
+            "cargo::warning=Android SDK is not found, falling back to the unmanaged prebuilt dex."
+        );
+        let out_dex_path = out_dir.join("classes.dex");
+        std::fs::copy(prebuilt_dex, out_dex_path).expect("Failed to access the prebuilt dex file");
+        return;
+    };
 
     // Compile the Java file into .class files
     let o = JavaBuild::new()

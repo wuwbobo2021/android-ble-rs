@@ -20,6 +20,7 @@ pub struct Excluder<T: Send + Clone> {
 /// Prevents other tasks from doing the same operation before the corresponding
 /// "foreign" callback is reiceived, or the timeout value is reached.
 struct LockMark {
+    id: usize,
     callback_sender: Sender<()>,
     #[allow(unused)]
     sender_keeper: InactiveReceiver<()>,
@@ -65,33 +66,49 @@ impl<T: Send + Clone> Excluder<T> {
     }
 
     /// Waits until the excluder is unlocked and locks the excluder.
+    ///
     /// Call this *right before* calling a method that will produce a "foreign" callback;
     /// after calling that method, call [ResultWaiter::wait_unlock] in the same task.
+    /// Otherwise, the lock will become invalid when the returned `ResultWaiter` is dropped;
+    /// even if it is not dropped, another task that tries to lock this excluder will sleep
+    /// for the general timeout value and then invalidate this lock with a new lock.
     pub async fn lock(&self) -> ResultWaiter<T> {
-        let mut tp_timeout_getting_timeout = Instant::now() + self.timeout;
-        loop {
-            let mut guard_inner = self.inner.lock().await;
+        let mut waited_without_tp_timeout = None;
+        let mut guard_inner = loop {
+            let guard_inner = self.inner.lock().await;
             if let Some(lock_mark) = guard_inner.as_ref() {
-                if let Some(tp_timeout) = lock_mark.tp_timeout.get() {
-                    if let Some(dur) = tp_timeout.checked_duration_since(Instant::now()) {
-                        let mut receiver = lock_mark.callback_sender.new_receiver();
-                        let fut = receiver.recv().or(async {
-                            Delay::new(dur).await;
-                            Err(async_broadcast::RecvError::Closed)
-                        });
-                        drop(guard_inner);
-                        let _ = fut.await;
-                        tp_timeout_getting_timeout = Instant::now() + self.timeout;
-                        continue;
+                if let Some(prev_id) = waited_without_tp_timeout.as_ref() {
+                    if prev_id != &lock_mark.id {
+                        let _ = waited_without_tp_timeout.take();
                     }
-                } else if Instant::now() < tp_timeout_getting_timeout {
-                    drop(guard_inner);
-                    Delay::new(Duration::from_millis(1)).await;
-                    continue;
                 }
+                let dur_wait = if let Some(tp_timeout) = lock_mark.tp_timeout.get() {
+                    if let Some(dur) = tp_timeout.checked_duration_since(Instant::now()) {
+                        dur
+                    } else {
+                        break guard_inner;
+                    }
+                } else if waited_without_tp_timeout.is_none() {
+                    waited_without_tp_timeout.replace(lock_mark.id);
+                    self.timeout
+                } else {
+                    break guard_inner;
+                };
+                if dur_wait.is_zero() {
+                    break guard_inner;
+                }
+                let mut receiver = lock_mark.callback_sender.new_receiver();
+                let fut = receiver.recv().or(async {
+                    Delay::new(dur_wait).await;
+                    Err(async_broadcast::RecvError::Closed)
+                });
+                drop(guard_inner);
+                let _ = fut.await;
+            } else {
+                break guard_inner;
             }
-            return self.unchecked_set_lock(&mut guard_inner);
-        }
+        };
+        self.unchecked_set_lock(&mut guard_inner)
     }
 
     /// Locks the excluder if it is previously unlocked.
@@ -113,14 +130,19 @@ impl<T: Send + Clone> Excluder<T> {
         &self,
         guard_inner: &mut MutexGuard<Option<LockMark>>,
     ) -> ResultWaiter<T> {
-        let (sender, receiver) = async_broadcast::broadcast(1);
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_LOCK_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let (sender, receiver) = async_broadcast::broadcast(2);
         let tp_timeout = Arc::new(OnceCell::new());
         let mark = LockMark {
+            id: NEXT_LOCK_ID.fetch_add(1, Ordering::SeqCst),
             callback_sender: sender,
             sender_keeper: receiver.clone().deactivate(),
             tp_timeout: tp_timeout.clone(),
         };
         guard_inner.replace(mark);
+
         ResultWaiter {
             receiver,
             last_val: Arc::downgrade(&self.last_val),
@@ -170,8 +192,7 @@ impl<T: Send + Clone> ResultWaiter<T> {
         let _ = self.tp_timeout.set_blocking(tp_timeout);
         let dur_wait = tp_timeout
             .checked_duration_since(Instant::now())
-            .unwrap_or(Duration::from_millis(1))
-            .max(Duration::from_millis(1));
+            .unwrap_or(Duration::from_millis(1));
         let res = self
             .receiver
             .recv()
@@ -189,7 +210,11 @@ impl<T: Send + Clone> ResultWaiter<T> {
 
 impl<T: Send + Clone> Drop for ResultWaiter<T> {
     fn drop(&mut self) {
-        let _ = self.tp_timeout.set_blocking(Instant::now());
+        // If `tp_timeout` is not previously set, it indicates that `wait_unlock` hasn't been called
+        // before dropping; in this case, just invalidate the registered lock immediately:
+        if self.tp_timeout.set_blocking(Instant::now()).is_ok() {
+            let _ = self.receiver.new_sender().broadcast_blocking(());
+        }
     }
 }
 

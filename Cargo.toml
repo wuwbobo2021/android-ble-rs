@@ -1,6 +1,6 @@
 [package]
 name = "android-ble"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["wuwbobo2021 <wuwbobo@outlook.com>"]
 edition = "2021"
 license = "BSD-2-Clause OR Apache-2.0"
@@ -12,13 +12,11 @@ Android Bluetooth API wrapper, currently supporting BLE client role operations.
 keywords = ["bluetooth", "ble", "gatt", "android", "bluest"]
 categories = ["api-bindings", "hardware-support"]
 
-# TODO: make dex building in the build script optional, so that choosing
-# `aarch64-linux-android` target can be possible here.
 [package.metadata.docs.rs]
 features = ["serde"]
-default-target = "x86_64-unknown-linux-gnu"
+default-target = "aarch64-linux-android"
 targets = [
-    "x86_64-unknown-linux-gnu",
+    "aarch64-linux-android",
 ]
 
 [features]

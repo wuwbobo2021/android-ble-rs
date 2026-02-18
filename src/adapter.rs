@@ -57,6 +57,8 @@ static CONN_MUTEX: async_lock::Mutex<()> = async_lock::Mutex::new(());
 ///
 /// By deafult, [ndk-context](https://docs.rs/ndk-context/0.1.1/ndk_context) is used for
 /// obtaining the JNI `JavaVM` pointer.
+///
+/// TODO: add an option for enforcing all operations of a device to lock the same mutex.
 pub struct AdapterConfig {
     /// - `vm` must be a valid JNI `JavaVM` pointer to a VM that will stay alive for the current
     ///   native library's lifetime. This is true for any library used by an Android application.
@@ -68,6 +70,8 @@ pub struct AdapterConfig {
     request_mtu_on_connect: bool,
     allow_multiple_connections: bool,
 }
+
+unsafe impl Send for AdapterConfig {}
 
 impl AdapterConfig {
     /// Creates a config for the default Bluetooth adapter for the system.
@@ -180,8 +184,8 @@ fn check_connection_permission() -> Result<(), crate::Error> {
 
 impl Adapter {
     /// Creates an interface to a Bluetooth adapter using the default config.
-    pub async fn default() -> Result<Self> {
-        Adapter::with_config(AdapterConfig::default()).await
+    pub async fn default() -> Option<Self> {
+        Adapter::with_config(AdapterConfig::default()).await.ok()
     }
 
     /// Creates an interface to a Bluetooth adapter. The `vm` pointer will be ignored

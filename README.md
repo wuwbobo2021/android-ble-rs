@@ -73,6 +73,7 @@ required = true
 [[package.metadata.android.uses_permission]]
 name = "android.permission.BLUETOOTH_SCAN"
 min_sdk_version = 31
+# TODO: add `usesPermissionFlags` (neverForLocation) when it becomes supported in `cargo-apk2`.
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.BLUETOOTH_CONNECT"
@@ -119,29 +120,6 @@ use log::info;
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
-    // Currently this requires `cargo-apk2` instead of `cargo-apk` to work.
-    // But this is required if the user chooses to confirm permission on every startup.
-    /*
-    let req = jni_min_helper::PermissionRequest::request(
-        "BLE Test",
-        [
-            "android.permission.BLUETOOTH_SCAN",
-            "android.permission.BLUETOOTH_CONNECT",
-            "android.permission.ACCESS_FINE_LOCATION",
-        ],
-    )?;
-    if let Some(req) = req {
-        info!("requesting permissions...");
-        let result = req.await;
-        for (perm_name, granted) in result.unwrap_or_default() {
-            if !granted {
-                eprintln!("{perm_name} is denied by the user.");
-                return Ok(());
-            }
-        }
-    };
-    */
-
     // View tracing log on the host PC with `adb logcat android_ble_test:D '*:S'`.
     android_logger::init_once(
         android_logger::Config::default()
@@ -184,7 +162,36 @@ fn android_main(app: AndroidApp) {
 
 // Please put your new test case here.
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
-    let adapter = bluest::Adapter::default().await?;
+    // Currently this requires `cargo-apk2` instead of `cargo-apk` to work.
+    // But this is required if the user chooses to confirm permission on every startup.
+    /*
+    let perm_list = if jni_min_helper::android_api_level() >= 31 {
+        vec![
+            "android.permission.BLUETOOTH_SCAN",
+            "android.permission.BLUETOOTH_CONNECT",
+            "android.permission.ACCESS_FINE_LOCATION", // TODO: remove this
+        ]
+    } else {
+        vec![
+            "android.permission.BLUETOOTH",
+            "android.permission.BLUETOOTH_ADMIN",
+            "android.permission.ACCESS_FINE_LOCATION",
+        ]
+    };
+    let req = jni_min_helper::PermissionRequest::request("BLE Test", perm_list)?;
+    if let Some(req) = req {
+        info!("requesting permissions...");
+        let result = req.await;
+        for (perm_name, granted) in result.unwrap_or_default() {
+            if !granted {
+                info!("{perm_name} is denied by the user.");
+                return Ok(());
+            }
+        }
+    };
+    */
+    
+    let adapter = bluest::Adapter::default().await.ok_or("adapter is unavailable")?;
     adapter.wait_available().await?;
     info!("starting scan...");
     let mut scan = adapter.scan(&[]).await?;
