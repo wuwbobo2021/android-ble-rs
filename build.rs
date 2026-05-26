@@ -8,11 +8,7 @@ fn main() {
         return;
     }
 
-    let java_srcs = [
-        "java/BluetoothGattCallback.java",
-        "java/ScanCallback.java",
-        "java/BroadcastReceiver.java",
-    ];
+    let java_srcs = ["java/BluetoothGattCallback.java", "java/ScanCallback.java"];
     let prebuilt_dex = "java/classes.dex";
 
     let out_dir: PathBuf = env::var_os("OUT_DIR").unwrap().into();

@@ -5,7 +5,7 @@ Android Bluetooth API wrapper, currently supporting BLE client role operations.
 A few portions of the code (especially `L2capChannel`) is orginally written by
 [Dirbaio](https://github.com/Dirbaio).
 
-Version 0.1.x of this crate is supposed to be API-compatible with version 0.6.x of
+Version 0.2.x of this crate is supposed to be API-compatible with version 0.6.x of
 the [bluest](https://docs.rs/crate/bluest/0.6.9) library. In fact, some type definitions
 are copied from `bluest`. Anything incompatible with `bluest` in the API may be reported as a bug.
 
