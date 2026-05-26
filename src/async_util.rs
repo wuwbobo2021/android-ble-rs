@@ -11,6 +11,61 @@ use futures_lite::{FutureExt, StreamExt};
 use futures_timer::Delay;
 
 /// Reusable exclusive register for `ResultWaiter`.
+///
+/// ```no_run
+/// use futures_lite::future::{self, FutureExt};
+/// use std::sync::LazyLock;
+///
+/// static EXCLUDER: LazyLock<Excluder<i32>> =
+///     LazyLock::new(|| Excluder::new(Duration::from_millis(20000)));
+///
+/// let (tx, rx) = async_channel::unbounded();
+///
+/// std::thread::spawn(move || loop {
+///     if let Ok(v) = rx.recv_blocking() {
+///         std::thread::sleep(std::time::Duration::from_millis(10));
+///         EXCLUDER.unlock(v);
+///     }
+/// });
+///
+/// let mut boxed_fut = async {}.boxed();
+/// for i in 0..1000 {
+///     let tx = tx.clone();
+///     boxed_fut = async move {
+///         future::zip(
+///             boxed_fut,
+///             async move {
+///                 let lock = EXCLUDER.lock().await;
+///                 if i % 17 == 0 {
+///                     drop(lock);
+///                     return;
+///                 }
+///                 Delay::new(Duration::from_millis(rand::random_range(..15))).await;
+///                 let _ = tx.send(i).await;
+///                 let v = lock
+///                     .wait_unlock()
+///                     .or(async move {
+///                         let t = if i % 2 == 0 {
+///                             10000
+///                         } else {
+///                             rand::random_range(..15)
+///                         };
+///                         Delay::new(Duration::from_millis(t)).await;
+///                         None
+///                     })
+///                     .await;
+///                 if let Some(v) = v {
+///                     assert_eq!(i, v);
+///                 }
+///             }
+///             .boxed(),
+///         )
+///         .await;
+///     }
+///     .boxed();
+/// }
+/// future::block_on(boxed_fut);
+/// ```
 pub struct Excluder<T: Send + Clone> {
     inner: Mutex<Option<LockMark>>,
     last_val: Arc<Mutex<Option<T>>>,
@@ -33,21 +88,6 @@ pub struct ResultWaiter<T: Send + Clone> {
     last_val: Weak<Mutex<Option<T>>>,
     tp_timeout: Arc<OnceCell<Instant>>,
     timeout: Duration,
-}
-
-impl<T: Send + Clone, E: Send + Clone> Excluder<Result<T, E>> {
-    /// Locks the excluder, does the operation that will produce the callback,
-    /// then waits for the callback's result.
-    #[allow(unused)]
-    pub async fn obtain(&self, operation: impl FnOnce() -> Result<(), E>) -> Result<Option<T>, E> {
-        let waiter = self.lock().await;
-        operation()?;
-        if let Some(res) = waiter.wait_unlock().await {
-            Ok(Some(res?))
-        } else {
-            Ok(None)
-        }
-    }
 }
 
 impl<T: Send + Clone> Excluder<T> {
@@ -226,7 +266,7 @@ pub struct Notifier<T: Send + Clone> {
 
 struct NotifierInner<T: Send + Clone> {
     sender: Sender<Option<T>>,
-    on_stop: Box<dyn Fn() + Send + Sync + 'static>,
+    on_stop: Option<Box<dyn FnOnce() + Send + Sync + 'static>>, // take for once on drop
 }
 
 pub struct NotifierReceiver<T: Send + Clone> {
@@ -255,8 +295,8 @@ impl<T: Send + Clone> Notifier<T> {
     ///   replaced if the notifier is already active.
     pub async fn subscribe<E>(
         &self,
-        on_start: impl FnOnce() -> Result<(), E>,
-        on_stop: impl Fn() + Send + Sync + 'static,
+        on_start: impl std::future::Future<Output = Result<(), E>>,
+        on_stop: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<NotifierReceiver<T>, E> {
         let mut guard_inner = self.inner.lock().await;
         if let Some(inner) = guard_inner.upgrade() {
@@ -266,12 +306,12 @@ impl<T: Send + Clone> Notifier<T> {
                 receiver,
             })
         } else {
-            on_start()?;
+            on_start.await?;
             let (mut sender, receiver) = async_broadcast::broadcast(self.capacity);
             sender.set_overflow(true);
             let new_inner = Arc::new(NotifierInner {
                 sender,
-                on_stop: Box::new(on_stop),
+                on_stop: Some(Box::new(on_stop)),
             });
             *guard_inner = Arc::downgrade(&new_inner);
             Ok(NotifierReceiver {
@@ -324,7 +364,8 @@ impl<T: Send + Clone> Drop for Notifier<T> {
 
 impl<T: Send + Clone> Drop for NotifierInner<T> {
     fn drop(&mut self) {
-        (self.on_stop)()
+        let on_stop = self.on_stop.take().unwrap();
+        on_stop()
     }
 }
 
@@ -345,7 +386,7 @@ where
 impl<T, E, S, F> StreamUntil<T, E, S, F>
 where
     T: Send + Unpin,
-    E: Send,
+    E: Send, // event
     S: Stream<Item = E> + Send + Unpin,
     F: Fn(&E) -> bool + Send + Sync + Unpin + 'static,
 {

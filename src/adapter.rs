@@ -1,40 +1,20 @@
-// Some portions of this code is orginally written by <https://github.com/Dirbaio>.
-
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use futures_core::Stream;
-use futures_lite::{stream, StreamExt};
-use java_spaghetti::{ByteArray, Env, Global, Local, Null, Ref};
-use log::{debug, warn};
+use futures_lite::StreamExt;
+use jni::{objects::JString, refs::Global};
+use log::warn;
 use uuid::Uuid;
 
-use super::async_util::StreamUntil;
-use super::bindings::android::bluetooth::le::{
-    ScanCallback, ScanFilter_Builder, ScanResult, ScanSettings, ScanSettings_Builder,
-};
-use super::bindings::android::bluetooth::{
-    BluetoothAdapter, BluetoothDevice, BluetoothGattCallback, BluetoothManager, BluetoothProfile,
-};
-use super::bindings::android::content::Context as AndroidContext;
-use super::bindings::android::os::ParcelUuid;
-use super::bindings::java::lang::String as JString;
-use super::bindings::java::util::Map_Entry;
-use super::bindings::java::{self};
-use super::device::Device;
-use super::error::ErrorKind;
-use super::event_receiver::{EventReceiver, GlobalEvent};
-use super::gatt_tree::{BluetoothGattCallbackProxy, CachedWeak, GattTree};
-use super::jni::{ByteArrayExt, Monitor, VM};
-use super::vm_context::{
-    android_api_level, android_context, android_has_permission, jni_get_vm, jni_set_vm,
-    jni_with_env,
-};
-use crate::util::{defer, JavaIterator, OptionExt, UuidExt};
-use crate::{
-    AdapterEvent, AdvertisementData, AdvertisingDevice, ConnectionEvent, DeviceId, Error,
-    ManufacturerData, Result,
-};
+use crate::async_util::StreamUntil;
+use crate::bindings;
+use crate::device::Device;
+use crate::error::ErrorKind;
+use crate::event_receiver::{EventReceiver, GlobalEvent};
+use crate::gatt_tree::{BluetoothGattCallbackProxy, GattTree};
+use crate::scanner::Scanner;
+use crate::util::{android_api_level, android_context, android_has_permission, jni_with_env};
+use crate::{callback, AdapterEvent, AdvertisingDevice, ConnectionEvent, DeviceId, Error, Result};
 
 /// The system’s Bluetooth adapter interface.
 #[derive(Clone)]
@@ -44,9 +24,8 @@ pub struct Adapter {
 
 struct AdapterInner {
     #[allow(unused)]
-    manager: Global<BluetoothManager>,
-    adapter: Global<BluetoothAdapter>,
-    global_event_receiver: Arc<EventReceiver>,
+    manager: Global<bindings::BluetoothManager<'static>>,
+    adapter: Global<bindings::BluetoothAdapter<'static>>,
     request_mtu_on_connect: bool,
     allow_multiple_connections: bool,
 }
@@ -55,49 +34,19 @@ static CONN_MUTEX: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
 /// Configuration for creating an interface to the default Bluetooth adapter of the system.
 ///
-/// By deafult, [ndk-context](https://docs.rs/ndk-context/0.1.1/ndk_context) is used for
-/// obtaining the JNI `JavaVM` pointer.
+/// [ndk-context](https://docs.rs/ndk-context/0.1.1/ndk_context) is used for obtaining the
+/// JNI `JavaVM` pointer, it is not configurable here.
 ///
-/// TODO: add an option for enforcing all operations of a device to lock the same mutex.
+/// TODO:
+/// - add an option for enforcing all operations of a device to lock the same mutex,
+///   improving compatibility for old devices.
+/// - have adjustable timeout values for device connection and GATT operations.
 pub struct AdapterConfig {
-    /// - `vm` must be a valid JNI `JavaVM` pointer to a VM that will stay alive for the current
-    ///   native library's lifetime. This is true for any library used by an Android application.
-    vm: *mut java_spaghetti::sys::JavaVM,
-    /// `manager` must be a valid global reference to an `android.bluetooth.BluetoothManager`
-    /// instance, from the `java_vm` VM.
-    manager: java_spaghetti::sys::jobject,
-
     request_mtu_on_connect: bool,
     allow_multiple_connections: bool,
 }
 
-unsafe impl Send for AdapterConfig {}
-
 impl AdapterConfig {
-    /// Creates a config for the default Bluetooth adapter for the system.
-    ///
-    /// You do not need to do this if you are using the `android_activity` crate for a native application.
-    ///
-    /// # Safety
-    ///
-    /// - `java_vm` must be a valid JNI `JavaVM` pointer to a VM that will stay alive for the current native
-    ///   library's lifetime. This is true for any library used by an Android application.
-    /// - `bluetooth_manager` must be a valid global reference to an `android.bluetooth.BluetoothManager`
-    ///   instance, from the `java_vm` VM.
-    /// - The `Adapter` takes ownership of the global reference and will delete it with the `DeleteGlobalRef`
-    ///   JNI call when dropped. You must not do that yourself.
-    pub unsafe fn new(
-        java_vm: *mut java_spaghetti::sys::JavaVM,
-        bluetooth_manager: java_spaghetti::sys::jobject,
-    ) -> Self {
-        Self {
-            vm: java_vm,
-            manager: bluetooth_manager,
-            request_mtu_on_connect: true,
-            allow_multiple_connections: true,
-        }
-    }
-
     /// If enabled, this library will request the BLE ATT MTU to 517 bytes during [Adapter::connect_device].
     /// See <https://developer.android.com/about/versions/14/behavior-changes-all#mtu-set-to-517>.
     ///
@@ -123,26 +72,17 @@ impl AdapterConfig {
 
 impl Default for AdapterConfig {
     fn default() -> Self {
-        jni_with_env(|env| {
-            let context = android_context().as_local(env);
-            let service_name = JString::from_env_str(env, AndroidContext::BLUETOOTH_SERVICE);
-            let manager = context
-                .getSystemService_String(service_name)
-                .unwrap()
-                .expect("Context.getSystemService() returned null for BLUETOOTH_SERVICE")
-                .cast::<BluetoothManager>()?
-                .as_global();
-            let config = unsafe { Self::new(jni_get_vm().as_raw(), manager.into_raw()) };
-            Ok::<_, Box<dyn std::error::Error>>(config)
-        })
-        .unwrap()
+        Self {
+            request_mtu_on_connect: true,
+            allow_multiple_connections: true,
+        }
     }
 }
 
 fn check_scan_permission() -> Result<(), crate::Error> {
     let has_perm = if android_api_level() >= 31 {
-        if android_has_permission("android.permission.BLUETOOTH_SCAN") {
-            if !android_has_permission("android.permission.ACCESS_FINE_LOCATION") {
+        if android_has_permission("android.permission.BLUETOOTH_SCAN")? {
+            if !android_has_permission("android.permission.ACCESS_FINE_LOCATION")? {
                 warn!("Please ensure `neverForLocation` is included in `android:usesPermissionFlags`.")
             }
             true // XXX
@@ -150,12 +90,12 @@ fn check_scan_permission() -> Result<(), crate::Error> {
             false
         }
     } else if android_api_level() >= 29 {
-        android_has_permission("android.permission.ACCESS_FINE_LOCATION")
-            && android_has_permission("android.permission.BLUETOOTH_ADMIN")
+        android_has_permission("android.permission.ACCESS_FINE_LOCATION")?
+            && android_has_permission("android.permission.BLUETOOTH_ADMIN")?
     } else {
-        (android_has_permission("android.permission.ACCESS_COARSE_LOCATION")
-            || android_has_permission("android.permission.ACCESS_FINE_LOCATION"))
-            && android_has_permission("android.permission.BLUETOOTH_ADMIN")
+        (android_has_permission("android.permission.ACCESS_COARSE_LOCATION")?
+            || android_has_permission("android.permission.ACCESS_FINE_LOCATION")?)
+            && android_has_permission("android.permission.BLUETOOTH_ADMIN")?
     };
     if !has_perm {
         return Err(crate::Error::new(
@@ -172,7 +112,7 @@ fn check_connection_permission() -> Result<(), crate::Error> {
         "android.permission.BLUETOOTH_CONNECT"
     } else {
         "android.permission.BLUETOOTH"
-    }) {
+    })? {
         return Err(crate::Error::new(
             ErrorKind::NotAuthorized,
             None,
@@ -188,45 +128,46 @@ impl Adapter {
         Adapter::with_config(AdapterConfig::default()).await.ok()
     }
 
-    /// Creates an interface to a Bluetooth adapter. The `vm` pointer will be ignored
-    /// if this has been called previously.
+    /// Creates an interface to a Bluetooth adapter.
     pub async fn with_config(config: AdapterConfig) -> Result<Self> {
-        unsafe {
-            let vm = VM::from_raw(config.vm);
-            let _ = jni_set_vm(vm);
+        jni_with_env(|env| {
+            bindings::jni_init(env, &jni::objects::LoaderContext::None)?;
+            let context = android_context(env);
+            let service_name = bindings::Context::BLUETOOTH_SERVICE(env)?;
+            let manager = context
+                .get_system_service(env, &service_name)
+                .map_err(|_| {
+                    Error::new(
+                        ErrorKind::AdapterUnavailable,
+                        None,
+                        "Failed to get the system service BLUETOOTH_SERVICE",
+                    )
+                })?;
+            let manager = env.new_cast_global_ref::<bindings::BluetoothManager>(manager)?;
 
-            let manager: Global<BluetoothManager> = Global::from_raw(vm.into(), config.manager);
-
-            jni_with_env(|env| {
-                let local_manager = manager.as_ref(env);
-                let adapter = local_manager.getAdapter()?.non_null()?;
-                Ok(Self {
-                    inner: Arc::new(AdapterInner {
-                        adapter: adapter.as_global(),
-                        manager: manager.clone(),
-                        global_event_receiver: EventReceiver::build()?,
-                        request_mtu_on_connect: config.request_mtu_on_connect,
-                        allow_multiple_connections: config.allow_multiple_connections,
-                    }),
-                })
+            let adapter = manager.get_adapter(env)?;
+            Ok(Self {
+                inner: Arc::new(AdapterInner {
+                    adapter: env.new_global_ref(adapter)?,
+                    manager,
+                    request_mtu_on_connect: config.request_mtu_on_connect,
+                    allow_multiple_connections: config.allow_multiple_connections,
+                }),
             })
-        }
+        })
     }
 
     /// A stream of [AdapterEvent] which allows the application to identify when the adapter is enabled or disabled.
     pub async fn events(
         &self,
     ) -> Result<impl Stream<Item = Result<AdapterEvent>> + Send + Unpin + '_> {
-        Ok(self
-            .inner
-            .global_event_receiver
-            .subscribe()
+        Ok(EventReceiver::subscribe()
             .await?
             .filter_map(|event| {
                 if let GlobalEvent::AdapterStateChanged(val) = event {
                     match val {
-                        BluetoothAdapter::STATE_ON => Some(AdapterEvent::Available),
-                        BluetoothAdapter::STATE_OFF => Some(AdapterEvent::Unavailable),
+                        bindings::BluetoothAdapter::STATE_ON => Some(AdapterEvent::Available),
+                        bindings::BluetoothAdapter::STATE_OFF => Some(AdapterEvent::Unavailable),
                         _ => None, // XXX: process "turning on" and "turning off" events
                     }
                 } else {
@@ -252,8 +193,7 @@ impl Adapter {
     /// Check if the adapter is available.
     pub async fn is_available(&self) -> Result<bool> {
         jni_with_env(|env| {
-            let adapter = self.inner.adapter.as_local(env);
-            adapter.isEnabled().map_err(|e| {
+            self.inner.adapter.is_enabled(env).map_err(|e| {
                 Error::new(ErrorKind::Internal, None, format!("isEnabled threw: {e:?}"))
             })
         })
@@ -270,23 +210,9 @@ impl Adapter {
             return Ok(dev);
         }
         jni_with_env(|env| {
-            let adapter = self.inner.adapter.as_local(env);
-            let device = adapter
-                .getRemoteDevice_String(JString::from_env_str(env, &id.0))
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::Internal,
-                        None,
-                        format!("getRemoteDevice threw: {e:?}"),
-                    )
-                })?
-                .non_null()?;
-            Ok(Device {
-                id: id.clone(),
-                device: device.as_global(),
-                connection: CachedWeak::new(),
-                once_connected: Arc::new(OnceLock::new()),
-            })
+            let addr = JString::new(env, &id.0)?;
+            let device = self.inner.adapter.get_remote_device(env, &addr)?;
+            Ok(Device::from_java(env, &device, false)?)
         })
     }
 
@@ -301,31 +227,16 @@ impl Adapter {
         if self.inner.allow_multiple_connections {
             let mut device_items = Vec::new();
             jni_with_env(|env| {
-                let manager = self.inner.manager.as_ref(env);
-                let devices = manager
-                    .getConnectedDevices(BluetoothProfile::GATT)?
-                    .non_null()?;
-                let iter_devices = JavaIterator(devices.iterator()?.non_null()?);
-
-                for device in iter_devices.filter_map(|dev| dev.cast::<BluetoothDevice>().ok()) {
-                    let id = DeviceId(
-                        device
-                            .getAddress()?
-                            .non_null()?
-                            .to_string_lossy()
-                            .trim()
-                            .to_string(),
-                    );
-                    let device_item = Device {
-                        id,
-                        device: device.as_global(),
-                        connection: CachedWeak::new(),
-                        // NOTE: this makes the `connect_device` called later to discover services as if it's reconnected.
-                        once_connected: Arc::new(OnceLock::from(())),
-                    };
+                let manager = &self.inner.manager;
+                let devices =
+                    manager.get_connected_devices(env, bindings::BluetoothProfile::GATT)?;
+                let iter_devices = devices.iter(env)?;
+                while let Some(device) = iter_devices.next(env)? {
+                    let device = env.cast_local::<bindings::BluetoothDevice>(device)?;
+                    let device_item = Device::from_java(env, &device, true)?;
                     device_items.push(device_item);
                 }
-                Ok::<_, crate::Error>(())
+                Ok(())
             })?;
             for device_item in &device_items {
                 if GattTree::find_connection(&device_item.id).is_none() {
@@ -365,98 +276,12 @@ impl Adapter {
     ///
     /// If `service_ids` is not empty, returns advertisements including at least one GATT service with a UUID in
     /// `services`. Otherwise returns all advertisements.
-    pub async fn scan<'a>(
-        &'a self,
-        service_ids: &'a [Uuid],
-    ) -> Result<impl Stream<Item = AdvertisingDevice> + Send + Unpin + 'a> {
+    pub async fn scan(
+        &self,
+        service_ids: &[Uuid],
+    ) -> Result<impl Stream<Item = AdvertisingDevice> + Send + Unpin + 'static> {
         check_scan_permission()?;
-        let (start_receiver, stream) = jni_with_env(|env| {
-            let (start_sender, start_receiver) = async_channel::bounded(1);
-            let (device_sender, device_receiver) = async_channel::bounded(16);
-
-            let callback = ScanCallback::new_proxy(
-                env,
-                Arc::new(ScanCallbackProxy {
-                    device_sender,
-                    start_sender,
-                }),
-            )?;
-            let callback_global = callback.as_global();
-
-            let adapter = self.inner.adapter.as_ref(env);
-            let adapter_global = adapter.as_global();
-            let adapter = Monitor::new(&adapter);
-            let scanner = adapter.getBluetoothLeScanner()?.non_null()?;
-            let scanner_global = scanner.as_global();
-
-            let settings_builder = ScanSettings_Builder::new(env)?;
-            settings_builder.setScanMode(ScanSettings::SCAN_MODE_LOW_LATENCY)?;
-            let settings = settings_builder.build()?.non_null()?;
-
-            if !service_ids.is_empty() {
-                let filter_builder = ScanFilter_Builder::new(env)?;
-                let filter_list = java::util::ArrayList::new(env)?;
-                for uuid in service_ids {
-                    let uuid_string = JString::from_env_str(env, uuid.to_string());
-                    let parcel_uuid = ParcelUuid::fromString(env, uuid_string)?;
-                    filter_builder.setServiceUuid_ParcelUuid(parcel_uuid)?;
-                    let filter = filter_builder.build()?.non_null()?;
-                    filter_list.add_Object(filter)?;
-                }
-                scanner.startScan_List_ScanSettings_ScanCallback(
-                    filter_list,
-                    settings,
-                    callback,
-                )?;
-            } else {
-                scanner.startScan_List_ScanSettings_ScanCallback(Null, settings, callback)?;
-            };
-
-            let guard = defer(move || {
-                jni_with_env(|env| {
-                    let callback = callback_global.as_ref(env);
-                    let scanner = scanner_global.as_ref(env);
-                    if adapter_global.as_ref(env).isEnabled().unwrap_or(false) {
-                        match scanner.stopScan_ScanCallback(callback) {
-                            Ok(()) => debug!("stopped scan"),
-                            Err(e) => warn!("failed to stop scan: {:?}", e),
-                        };
-                    }
-                });
-            });
-
-            Ok::<_, crate::Error>((
-                start_receiver,
-                Box::pin(device_receiver).map(move |adv_dev| {
-                    let _guard = &guard;
-                    adv_dev
-                }),
-            ))
-        })?;
-
-        #[rustfmt::skip]
-        let stream = StreamUntil::create(
-            stream,
-            self.inner.global_event_receiver.subscribe().await?,
-            |event| {
-                matches!(
-                    event,
-                    GlobalEvent::DiscoveryFinished
-                        | GlobalEvent::AdapterStateChanged(BluetoothAdapter::STATE_OFF)
-                )
-            }
-        );
-
-        // Wait for scan started or failed.
-        match start_receiver.recv().await {
-            Ok(Ok(())) => Ok(stream),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(Error::new(
-                ErrorKind::Internal,
-                None,
-                format!("receiving failed while waiting for start: {e:?}"),
-            )),
-        }
+        Scanner::scan(&self.inner.adapter, service_ids).await
     }
 
     /// Finds Bluetooth devices providing any service in `services`.
@@ -469,6 +294,7 @@ impl Adapter {
         &'a self,
         services: &'a [Uuid],
     ) -> Result<impl Stream<Item = Result<Device>> + Send + Unpin + 'a> {
+        use futures_lite::stream;
         let connected = stream::iter(self.connected_devices_with_services(services).await?).map(Ok);
 
         // try_unfold is used to ensure we do not start scanning until the connected devices have been consumed
@@ -499,32 +325,15 @@ impl Adapter {
         }
         let callback_hdl = BluetoothGattCallbackProxy::new(device.id());
         jni_with_env(|env| {
-            let adapter = self.inner.adapter.as_ref(env);
-            let _lock = Monitor::new(&adapter);
-            let device_obj = device.device.as_local(env);
-            let proxy = BluetoothGattCallback::new_proxy(env, callback_hdl.clone())?;
-            let gatt = device_obj
-                .connectGatt_Context_boolean_BluetoothGattCallback(
-                    android_context().as_ref(env),
-                    false,
-                    proxy,
-                )
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::Internal,
-                        None,
-                        format!("connectGatt threw: {e:?}"),
-                    )
-                })?
-                .non_null()?
-                .as_global();
-            GattTree::register_connection(
-                &device.id(),
-                gatt,
-                &callback_hdl,
-                &self.inner.global_event_receiver,
-            );
-            Ok::<_, crate::Error>(())
+            let context = android_context(env);
+            let adapter = &self.inner.adapter;
+            let _lock_adapter = env.lock_obj(adapter)?;
+            let device_obj = &device.device;
+            let proxy =
+                callback::BluetoothGattCallbackJavaProxy::new_proxy(env, callback_hdl.clone())?;
+            let gatt = device_obj.connect_gatt(env, &context, false, proxy)?;
+            GattTree::register_connection(&device.id(), env.new_global_ref(gatt)?, &callback_hdl);
+            Ok(())
         })?;
         if !self.is_actually_connected(&device.id())? {
             GattTree::wait_connection_available(&device.id()).await?;
@@ -532,12 +341,10 @@ impl Adapter {
         if self.inner.request_mtu_on_connect {
             let conn = GattTree::check_connection(&device.id())?;
             let mtu_lock = conn.mtu_changed_received.lock().await;
-            jni_with_env(|env| {
-                let gatt = conn.gatt.as_ref(env);
-                let gatt = Monitor::new(&gatt);
-                gatt.requestMtu(517)?;
-                Ok::<_, crate::Error>(())
-            })?;
+            GattTree::jni_with_locked_gatt(None, &device.id, |conn, env| {
+                Ok(conn.gatt.request_mtu(env, 517)?)
+            })
+            .await?;
             let _ = mtu_lock.wait_unlock().await;
         }
         // validates GATT tree API objects again upon reconnection
@@ -553,23 +360,10 @@ impl Adapter {
     /// XXX: manage to call this internally when all API wrapper objects for the device are dropped.
     pub async fn disconnect_device(&self, device: &Device) -> Result<()> {
         let _conn_lock = CONN_MUTEX.lock().await;
-        let Ok(conn) = device.get_connection() else {
-            return Ok(());
-        };
-        jni_with_env(|env| {
-            let adapter = self.inner.adapter.as_ref(env);
-            let _lock = Monitor::new(&adapter);
-            let gatt = &conn.gatt.as_ref(env);
-            let gatt = Monitor::new(gatt);
-            gatt.disconnect().map_err(|e| {
-                Error::new(
-                    ErrorKind::Internal,
-                    None,
-                    format!("BluetoothGatt.disconnect() threw: {e:?}"),
-                )
-            })?;
-            Ok::<_, crate::Error>(())
-        })?;
+        GattTree::jni_with_locked_gatt(Some(self), &device.id, |conn, env| {
+            Ok(conn.gatt.disconnect(env)?)
+        })
+        .await?;
         GattTree::deregister_connection(&device.id());
         Ok(())
     }
@@ -599,16 +393,20 @@ impl Adapter {
         ))
     }
 
+    pub(crate) fn java_adapter(&self) -> &bindings::BluetoothAdapter<'static> {
+        &self.inner.adapter
+    }
+
     // NOTE: this returns true even if the device is connected outside this crate.
     pub(crate) fn is_actually_connected(&self, dev_id: &DeviceId) -> Result<bool> {
         jni_with_env(|env| {
-            let manager = self.inner.manager.as_ref(env);
-            let devices = manager
-                .getConnectedDevices(BluetoothProfile::GATT)?
-                .non_null()?;
-            let iter_devices = JavaIterator(devices.iterator()?.non_null()?);
-            for device in iter_devices.filter_map(|dev| dev.cast::<BluetoothDevice>().ok()) {
-                if dev_id.0 == device.getAddress()?.non_null()?.to_string_lossy().trim() {
+            let manager = &self.inner.manager;
+            let devices = manager.get_connected_devices(env, bindings::BluetoothProfile::GATT)?;
+            let jiter_devices = devices.iter(env)?;
+            while let Some(device) = jiter_devices.next(env)? {
+                let device = env.as_cast::<bindings::BluetoothDevice>(&device)?;
+                let addr = DeviceId::from_java_dev(env, &device)?;
+                if dev_id == &addr {
                     return Ok(true);
                 }
             }
@@ -632,149 +430,5 @@ impl std::hash::Hash for Adapter {
 impl std::fmt::Debug for Adapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("Adapter").finish()
-    }
-}
-
-struct ScanCallbackProxy {
-    start_sender: async_channel::Sender<Result<()>>,
-    device_sender: async_channel::Sender<AdvertisingDevice>,
-}
-
-impl super::callback::ScanCallbackProxy for ScanCallbackProxy {
-    fn onScanFailed<'env>(&self, _env: Env<'env>, error_code: i32) {
-        let e = Error::new(
-            ErrorKind::Internal,
-            None,
-            format!("Scan failed to start with error code {error_code}"),
-        );
-        if let Err(e) = self.start_sender.try_send(Err(e)) {
-            warn!("onScanFailed failed to send error: {e:?}");
-        }
-    }
-
-    fn onBatchScanResults<'env>(
-        &self,
-        env: Env<'env>,
-        scan_results: Option<Ref<'env, super::bindings::java::util::List>>,
-    ) {
-        let Some(scan_results) = scan_results else {
-            warn!("onBatchScanResults: ignoring null scan_results");
-            return;
-        };
-
-        if let Err(e) = self.on_scan_result_list(env, &scan_results) {
-            warn!("onBatchScanResults failed: {e:?}");
-        }
-    }
-
-    fn onScanResult<'env>(
-        &self,
-        env: Env<'env>,
-        _callback_type: i32,
-        scan_result: Option<Ref<'env, ScanResult>>,
-    ) {
-        let Some(scan_result) = scan_result else {
-            warn!("onScanResult: ignoring null scan_result");
-            return;
-        };
-
-        if let Err(e) = self.on_scan_result(env, &scan_result) {
-            warn!("onScanResult failed: {e:?}");
-        }
-    }
-}
-
-impl ScanCallbackProxy {
-    fn on_scan_result_list(
-        &self,
-        env: Env<'_>,
-        scan_results: &Ref<super::bindings::java::util::List>,
-    ) -> Result<()> {
-        for scan_result in JavaIterator(scan_results.iterator()?.non_null()?) {
-            let scan_result: Local<ScanResult> = scan_result.cast()?;
-            self.on_scan_result(env, &scan_result.as_ref())?;
-        }
-        Ok(())
-    }
-
-    fn on_scan_result(&self, _env: Env<'_>, scan_result: &Ref<ScanResult>) -> Result<()> {
-        let scan_record = scan_result.getScanRecord()?.non_null()?;
-        let device = scan_result.getDevice()?.non_null()?;
-
-        let address = device
-            .getAddress()?
-            .non_null()?
-            .to_string_lossy()
-            .trim()
-            .to_string();
-        let rssi = scan_result.getRssi()?;
-        let is_connectable = if android_api_level() >= 26 {
-            scan_result.isConnectable()?
-        } else {
-            true // XXX: try to check `eventType` via `ScanResult.toString()`
-        };
-        let local_name = scan_record.getDeviceName()?.map(|s| s.to_string_lossy());
-        let tx_power_level = scan_record.getTxPowerLevel()?;
-
-        // Services
-        let mut services = Vec::new();
-        if let Some(uuids) = scan_record.getServiceUuids()? {
-            for uuid in JavaIterator(uuids.iterator()?.non_null()?) {
-                services.push(Uuid::from_andriod_parcel(uuid.cast()?)?)
-            }
-        }
-
-        // Service data
-        let mut service_data = HashMap::new();
-        let sd = scan_record.getServiceData()?.non_null()?;
-        let sd = sd.entrySet()?.non_null()?;
-        for entry in JavaIterator(sd.iterator()?.non_null()?) {
-            let entry: Local<Map_Entry> = entry.cast()?;
-            let key: Local<ParcelUuid> = entry.getKey()?.non_null()?.cast()?;
-            let val: Local<ByteArray> = entry.getValue()?.non_null()?.cast()?;
-            service_data.insert(Uuid::from_andriod_parcel(key)?, val.as_vec_u8());
-        }
-
-        // Manufacturer data
-        let mut manufacturer_data = None;
-        let msd = scan_record.getManufacturerSpecificData()?.non_null()?;
-        // TODO: there can be multiple manufacturer data entries, but the API (compatible with bluest)
-        // only supports one. So grab just the first.
-        if msd.size()? != 0 {
-            let val: Local<'_, ByteArray> = msd.valueAt(0)?.non_null()?.cast()?;
-            manufacturer_data = Some(ManufacturerData {
-                company_id: msd.keyAt(0)? as _,
-                data: val.as_vec_u8(),
-            });
-        }
-
-        let device_id = DeviceId(address);
-
-        let d = AdvertisingDevice {
-            device: Device {
-                id: device_id.clone(),
-                device: device.as_global(),
-                connection: CachedWeak::new(),
-                once_connected: Arc::new(if GattTree::find_connection(&device_id).is_none() {
-                    OnceLock::new()
-                } else {
-                    OnceLock::from(()) // NOTE: this is unlikely to happen
-                }),
-            },
-            adv_data: AdvertisementData {
-                is_connectable,
-                local_name,
-                manufacturer_data, // TODO, SparseArray is cursed.
-                service_data,
-                services,
-                tx_power_level: Some(tx_power_level as _),
-            },
-            rssi: Some(rssi as _),
-        };
-
-        self.start_sender.try_send(Ok(())).ok();
-        self.device_sender.try_send(d).ok();
-
-        Ok(())
     }
 }

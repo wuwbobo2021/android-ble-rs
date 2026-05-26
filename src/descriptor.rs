@@ -1,13 +1,11 @@
 use std::sync::Arc;
 
-use java_spaghetti::ByteArray;
+use jni::objects::JByteArray;
 
-use super::error::ErrorKind;
-use super::gatt_tree::{CachedWeak, DescriptorInner, GattTree};
-use super::jni::{ByteArrayExt, Monitor};
-use super::util::{BoolExt, IntExt, OptionExt};
-use super::vm_context::{android_api_level, jni_with_env};
-use super::{DeviceId, Result, Uuid};
+use crate::error::ErrorKind;
+use crate::gatt_tree::{DescriptorInner, GattTree};
+use crate::util::{android_api_level, BoolExt, CachedWeak, IntExt, JByteArrayExt, OptionExt};
+use crate::{DeviceId, Result, Uuid};
 
 /// A Bluetooth GATT descriptor.
 #[derive(Debug, Clone)]
@@ -68,18 +66,16 @@ impl Descriptor {
 
     /// Read the value of this descriptor from the device.
     pub async fn read(&self) -> Result<Vec<u8>> {
-        let conn = GattTree::check_connection(&self.dev_id)?;
         let inner = self.get_inner()?;
         let read_lock = inner.read.lock().await;
         let _write_lock = inner.write.lock().await;
-        jni_with_env(|env| {
-            let gatt = &conn.gatt.as_ref(env);
-            let gatt = Monitor::new(gatt);
-            gatt.readDescriptor(inner.desc.as_ref(env))
+        GattTree::jni_with_locked_gatt(None, &self.dev_id, move |conn, env| {
+            conn.gatt
+                .read_descriptor(env, &inner.desc) // `inner` moved here
                 .map_err(|e| e.into())
                 .and_then(|b| b.non_false())
-        })?;
-        drop((conn, inner));
+        })
+        .await?;
         read_lock
             .wait_unlock()
             .await
@@ -88,28 +84,28 @@ impl Descriptor {
 
     /// Write the `value` to this descriptor on the device.
     pub async fn write(&self, value: &[u8]) -> Result<()> {
-        let conn = GattTree::check_connection(&self.dev_id)?;
+        let value = value.to_vec();
         let inner = self.get_inner()?;
         let _read_lock = inner.read.lock().await;
         let write_lock = inner.write.lock().await;
-        jni_with_env(|env| {
-            let gatt = conn.gatt.as_ref(env);
-            let gatt = Monitor::new(&gatt);
-            let desc = inner.desc.as_ref(env);
-            let array = ByteArray::from_slice(env, value);
+        GattTree::jni_with_locked_gatt(None, &self.dev_id, move |conn, env| {
+            let desc = &inner.desc; // `inner` moved here
+            let array = JByteArray::from_slice(env, &value)?;
             if android_api_level() >= 33 {
-                gatt.writeDescriptor_BluetoothGattDescriptor_byte_array(desc, array)?
+                conn.gatt
+                    .as_new_api()
+                    .write_descriptor(env, desc, array)?
                     .check_status_code()
             } else {
-                #[allow(deprecated)]
-                desc.setValue(array)?;
-                #[allow(deprecated)]
-                gatt.writeDescriptor_BluetoothGattDescriptor(desc)
+                desc.as_old_api().set_value(env, array)?;
+                conn.gatt
+                    .as_old_api()
+                    .write_descriptor(env, desc)
                     .map_err(|e| e.into())
                     .and_then(|b| b.non_false())
             }
-        })?;
-        drop((conn, inner));
+        })
+        .await?;
         write_lock
             .wait_unlock()
             .await

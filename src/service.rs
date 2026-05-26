@@ -1,14 +1,9 @@
 use std::sync::Arc;
 
-use super::bindings::android::bluetooth::BluetoothGattService;
-use super::characteristic::Characteristic;
-use super::gatt_tree::{CachedWeak, GattTree, ServiceInner};
-use super::util::OptionExt;
-use super::util::{JavaIterator, UuidExt};
-use super::vm_context::jni_with_env;
-use super::DeviceId;
-
-use crate::{Result, Uuid};
+use crate::characteristic::Characteristic;
+use crate::gatt_tree::{GattTree, ServiceInner};
+use crate::util::{jni_with_env, CachedWeak, OptionExt, UuidExt};
+use crate::{bindings, DeviceId, Result, Uuid};
 
 /// A Bluetooth GATT service.
 #[derive(Debug, Clone)]
@@ -55,8 +50,8 @@ impl Service {
     /// Whether this is a primary service of the device.
     pub async fn is_primary(&self) -> Result<bool> {
         jni_with_env(|env| {
-            Ok(self.get_inner()?.service.as_ref(env).getType()?
-                == BluetoothGattService::SERVICE_TYPE_PRIMARY)
+            Ok(self.get_inner()?.service.get_type(env)?
+                == bindings::BluetoothGattService::SERVICE_TYPE_PRIMARY)
         })
     }
 
@@ -113,16 +108,16 @@ impl Service {
     pub async fn included_services(&self) -> Result<Vec<Service>> {
         jni_with_env(|env| {
             let inner = self.get_inner()?;
-            let service = inner.service.as_ref(env);
-            let includes = service.getIncludedServices()?.non_null()?;
-            let vec = JavaIterator(includes.iterator()?.non_null()?)
-                .filter_map(|serv| {
-                    serv.cast::<BluetoothGattService>()
-                        .ok()
-                        .and_then(|serv| Uuid::from_java(serv.getUuid().ok()??.as_ref()).ok())
-                })
-                .map(|uuid| Service::new(self.dev_id.clone(), uuid))
-                .collect();
+            let service = &inner.service;
+            let includes = service.get_included_services(env)?;
+            let jiter_includes = includes.iter(env)?;
+            let mut vec = Vec::new();
+            while let Some(serv) = jiter_includes.next(env)? {
+                let serv = env.as_cast::<bindings::BluetoothGattService>(&serv)?;
+                let uuid = serv.get_uuid(env)?;
+                let uuid = Uuid::from_java(env, &uuid)?;
+                vec.push(Service::new(self.dev_id.clone(), uuid));
+            }
             Ok(vec)
         })
     }

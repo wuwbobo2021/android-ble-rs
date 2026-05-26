@@ -1,7 +1,7 @@
 //! Android Bluetooth API wrapper, currently supporting BLE client role operations.
 //!
-//! Version 0.1.x of this crate is supposed to be API-compatible with version 0.6.x of `bluest` library.
-//! Anything incompatible with `bluest` in the API may be reported as a bug.
+//! Version 0.2.x of this crate is supposed to be API-compatible with version 0.6.x of `bluest` library.
+//! Anything incompatible with `bluest` (without the `unstable` feature) in the API may be reported as a bug.
 //!
 //! This crate uses `ndk_context::AndroidContext`, which is automatically initialized by `android_activity`.
 //! The basic Android test template is provided in the crate page.
@@ -33,13 +33,9 @@ mod device;
 mod event_receiver;
 mod gatt_tree;
 mod l2cap_channel;
+mod scanner;
 mod service;
 mod util;
 
-// **NOTE**: it is important to use `jni_get_vm` or `jni_with_env` instead of `Global::vm`
-// so that a few bugs in `java-spaghetti` 0.2.0 may be avoided.
-#[allow(mismatched_lifetime_syntaxes)]
 mod bindings;
 mod callback;
-mod jni;
-mod vm_context;

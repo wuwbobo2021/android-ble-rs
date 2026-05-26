@@ -2,82 +2,54 @@
 
 use std::fmt::Debug;
 use std::num::NonZeroI32;
+use std::sync::Arc;
 
-use super::bindings::{android::bluetooth::BluetoothStatusCodes, java::lang::Throwable};
-use super::vm_context::jni_with_env;
+use crate::bindings::BluetoothStatusCodes;
 
 /// Internal error type, not compatible with `bluest::Error`.
-#[derive(Clone)]
+#[non_exhaustive]
+#[derive(Clone, Debug)]
 pub enum NativeError {
     GattError(AttError),
     BluetoothStatusCode(BluetoothStatusCode),
-    JavaError(java_spaghetti::Global<Throwable>),
-    JavaCastError,
-    JavaNullResult,
+    JavaError(Arc<jni::errors::Error>),
     JavaCallReturnedFalse,
 }
 
 impl std::error::Error for NativeError {}
-
-impl std::fmt::Debug for NativeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::GattError(att_err) => write!(f, "GattError({att_err:?})"),
-            Self::BluetoothStatusCode(code) => write!(f, "BluetoothStatusCode({code:?})"),
-            Self::JavaError(err) => jni_with_env(|env| {
-                let th = err.as_ref(env);
-                write!(f, "{th:?}")
-            }),
-            Self::JavaCastError => write!(f, "JavaCastError"),
-            Self::JavaNullResult => write!(f, "JavaNullResult"),
-            Self::JavaCallReturnedFalse => write!(f, "JavaCallReturnedFalse"),
-        }
-    }
-}
 
 impl std::fmt::Display for NativeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::GattError(att_error) => write!(f, "GATT error: {att_error}"),
             Self::BluetoothStatusCode(st) => write!(f, "{st}"),
-            Self::JavaError(err) => jni_with_env(|env| {
-                let th = err.as_ref(env);
-                write!(f, "Java Throwable: {th:?}")
-            }),
-            Self::JavaCastError => write!(f, "Java object cast failed"),
-            Self::JavaNullResult => write!(f, "Java call unexpectedly returned null"),
+            Self::JavaError(err) => write!(f, "Java/JNI error: {err:?}"),
             Self::JavaCallReturnedFalse => write!(f, "Java call unexpectedly returned false"),
         }
     }
 }
 
-impl From<java_spaghetti::Local<'_, Throwable>> for NativeError {
-    fn from(e: java_spaghetti::Local<'_, Throwable>) -> Self {
-        Self::JavaError(e.as_global())
+impl From<jni::errors::Error> for NativeError {
+    fn from(e: jni::errors::Error) -> Self {
+        Self::JavaError(Arc::new(e))
+    }
+}
+
+impl From<jni::errors::Error> for crate::Error {
+    fn from(e: jni::errors::Error) -> Self {
+        let native_err = NativeError::from(e);
+        let message = format!("{native_err}");
+        Self {
+            kind: ErrorKind::Internal,
+            source: Some(native_err),
+            message,
+        }
     }
 }
 
 impl From<AttError> for NativeError {
     fn from(att_error: AttError) -> Self {
         Self::GattError(att_error)
-    }
-}
-
-impl From<java_spaghetti::CastError> for NativeError {
-    fn from(_: java_spaghetti::CastError) -> Self {
-        Self::JavaCastError
-    }
-}
-
-impl From<java_spaghetti::Local<'_, Throwable>> for Error {
-    fn from(e: java_spaghetti::Local<'_, Throwable>) -> Self {
-        NativeError::from(e).into()
-    }
-}
-
-impl From<java_spaghetti::CastError> for Error {
-    fn from(e: java_spaghetti::CastError) -> Self {
-        NativeError::from(e).into()
     }
 }
 
@@ -114,10 +86,7 @@ impl From<NativeError> for Error {
                 FeatureNotSupported => ErrorKind::NotSupported,
                 UnknownError(_) => ErrorKind::Other,
             },
-            NativeError::JavaError(_)
-            | NativeError::JavaCastError
-            | NativeError::JavaNullResult
-            | NativeError::JavaCallReturnedFalse => ErrorKind::Internal,
+            NativeError::JavaError(_) | NativeError::JavaCallReturnedFalse => ErrorKind::Internal,
         };
         let msg = err.to_string();
         Error::new(kind, Some(err), msg)
@@ -171,18 +140,19 @@ impl std::fmt::Display for BluetoothStatusCode {
 impl From<NonZeroI32> for BluetoothStatusCode {
     fn from(code: NonZeroI32) -> Self {
         let raw_code = code.get();
+        use BluetoothStatusCodes as Codes;
         match raw_code {
-            BluetoothStatusCodes::ERROR_BLUETOOTH_NOT_ALLOWED => Self::NotAllowed,
-            BluetoothStatusCodes::ERROR_BLUETOOTH_NOT_ENABLED => Self::NotEnabled,
-            BluetoothStatusCodes::ERROR_DEVICE_NOT_BONDED => Self::NotBonded,
-            BluetoothStatusCodes::ERROR_GATT_WRITE_NOT_ALLOWED => Self::GattWriteNotAllowed,
-            BluetoothStatusCodes::ERROR_GATT_WRITE_REQUEST_BUSY => Self::GattWriteBusy,
-            BluetoothStatusCodes::ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION => {
+            Codes::ERROR_BLUETOOTH_NOT_ALLOWED => Self::NotAllowed,
+            Codes::ERROR_BLUETOOTH_NOT_ENABLED => Self::NotEnabled,
+            Codes::ERROR_DEVICE_NOT_BONDED => Self::NotBonded,
+            Codes::ERROR_GATT_WRITE_NOT_ALLOWED => Self::GattWriteNotAllowed,
+            Codes::ERROR_GATT_WRITE_REQUEST_BUSY => Self::GattWriteBusy,
+            Codes::ERROR_MISSING_BLUETOOTH_CONNECT_PERMISSION => {
                 Self::MissingBluetoothConnectPermission
             }
-            BluetoothStatusCodes::ERROR_PROFILE_SERVICE_NOT_BOUND => Self::ProfileServiceNotBound,
-            BluetoothStatusCodes::ERROR_UNKNOWN => Self::Unknown,
-            BluetoothStatusCodes::FEATURE_NOT_SUPPORTED => Self::FeatureNotSupported,
+            Codes::ERROR_PROFILE_SERVICE_NOT_BOUND => Self::ProfileServiceNotBound,
+            Codes::ERROR_UNKNOWN => Self::Unknown,
+            Codes::FEATURE_NOT_SUPPORTED => Self::FeatureNotSupported,
             _ => Self::UnknownError(code),
         }
     }
@@ -219,6 +189,11 @@ impl Error {
     /// Returns the message for this error.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Returns a cloned source error if exists.
+    pub fn source_cloned(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.source.clone().map(|e| Box::new(e) as _)
     }
 }
 

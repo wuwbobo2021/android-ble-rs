@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
 use futures_core::Stream;
-use java_spaghetti::ByteArray;
+use jni::objects::JByteArray;
 use uuid::Uuid;
 
-use super::bindings::android::bluetooth::BluetoothGattCharacteristic;
-use super::descriptor::Descriptor;
-use super::error::ErrorKind;
-use super::gatt_tree::{CachedWeak, CharacteristicInner, GattTree};
-use super::jni::{ByteArrayExt, Monitor};
-use super::util::{BoolExt, IntExt, OptionExt};
-use super::vm_context::{android_api_level, jni_with_env};
-use super::{CharacteristicProperties, DeviceId, Result};
+use crate::bindings::{self, BluetoothGattCharacteristic};
+use crate::descriptor::Descriptor;
+use crate::error::ErrorKind;
+use crate::gatt_tree::{CharacteristicInner, GattTree};
+use crate::util::{
+    android_api_level, jni_with_env, post_to_main_looper, BoolExt, CachedWeak, IntExt,
+    JByteArrayExt, OptionExt,
+};
+use crate::{CharacteristicProperties, DeviceId, Result};
 
 /// A Bluetooth GATT characteristic.
 #[derive(Debug, Clone)]
@@ -66,7 +67,7 @@ impl Characteristic {
     /// may be performed on this characteristic.
     pub async fn properties(&self) -> Result<CharacteristicProperties> {
         jni_with_env(|env| {
-            let val = self.get_inner()?.char.as_ref(env).getProperties()?;
+            let val = self.get_inner()?.char.get_properties(env)?;
             Ok(CharacteristicProperties::from_bits(val.cast_unsigned()))
         })
     }
@@ -86,23 +87,21 @@ impl Characteristic {
     // NOTE: the sequence of gaining read lock and write lock should be the same
     // in `read` and `write` methods, otherwise deadlock may occur.
     //
-    // To make `wait_unlock` exit on device disconnection, `drop((conn, inner))`
-    // cannot be removed here.
+    // To make `wait_unlock` exit on device disconnection, `inner` needs to be
+    // moved and dropped in `jni_with_locked_gatt` closure.
 
     /// Read the value of this characteristic from the device.
     pub async fn read(&self) -> Result<Vec<u8>> {
-        let conn = GattTree::check_connection(&self.dev_id)?;
         let inner = self.get_inner()?;
         let read_lock = inner.read.lock().await;
         let _write_lock = inner.write.lock().await;
-        jni_with_env(|env| {
-            let gatt = &conn.gatt.as_ref(env);
-            let gatt = Monitor::new(gatt);
-            gatt.readCharacteristic(inner.char.as_ref(env))
+        GattTree::jni_with_locked_gatt(None, &self.dev_id, move |conn, env| {
+            conn.gatt
+                .read_characteristic(env, &inner.char) // `inner` moved here
                 .map_err(|e| e.into())
                 .and_then(|b| b.non_false())
-        })?;
-        drop((conn, inner));
+        })
+        .await?;
         read_lock
             .wait_unlock()
             .await
@@ -137,36 +136,34 @@ impl Characteristic {
     }
 
     async fn write_internal(&self, value: &[u8], with_response: bool) -> Result<()> {
-        let conn = GattTree::check_connection(&self.dev_id)?;
+        let value = value.to_vec();
         let inner = self.get_inner()?;
         let _read_lock = inner.read.lock().await;
         let write_lock = inner.write.lock().await;
-        jni_with_env(|env| {
-            let gatt = conn.gatt.as_ref(env);
-            let gatt = Monitor::new(&gatt);
-            let char = inner.char.as_ref(env);
-            let array = ByteArray::from_slice(env, value);
+        GattTree::jni_with_locked_gatt(None, &self.dev_id, move |conn, env| {
+            let char = &inner.char; // `inner` moved here
+            let array = JByteArray::from_slice(env, &value)?;
             let write_type = if with_response {
                 BluetoothGattCharacteristic::WRITE_TYPE_DEFAULT
             } else {
                 BluetoothGattCharacteristic::WRITE_TYPE_NO_RESPONSE
             };
-            char.setWriteType(write_type)?;
+            char.set_write_type(env, write_type)?;
             if android_api_level() >= 33 {
-                gatt.writeCharacteristic_BluetoothGattCharacteristic_byte_array_int(
-                    char, array, write_type,
-                )?
-                .check_status_code()
+                conn.gatt
+                    .as_new_api()
+                    .write_characteristic(env, char, array, write_type)?
+                    .check_status_code()
             } else {
-                #[allow(deprecated)]
-                char.setValue_byte_array(array)?;
-                #[allow(deprecated)]
-                gatt.writeCharacteristic_BluetoothGattCharacteristic(char)
+                char.as_old_api().set_value(env, array)?;
+                conn.gatt
+                    .as_old_api()
+                    .write_characteristic(env, char)
                     .map_err(|e| e.into())
                     .and_then(|b| b.non_false())
             }
-        })?;
-        drop((conn, inner));
+        })
+        .await?;
         write_lock
             .wait_unlock()
             .await
@@ -197,26 +194,36 @@ impl Characteristic {
         let conn = GattTree::check_connection(&self.dev_id)?;
         let inner = self.get_inner()?;
         let inner_2 = inner.clone();
-        let (gatt_for_stop, char_for_stop) = (conn.gatt.clone(), inner.char.clone());
+        // NOTE: This is a workaround; using tuple instead of this struct triggers something like
+        // <https://github.com/jni-rs/jni-rs/issues/782>, which is probably related to a Rust bug.
+        struct ResOnStop {
+            gatt: jni::refs::Global<bindings::BluetoothGatt<'static>>,
+            char: jni::refs::Global<bindings::BluetoothGattCharacteristic<'static>>,
+        }
+        let res_on_stop = jni_with_env(|env| {
+            let gatt = env.new_global_ref(&conn.gatt)?;
+            let char = env.new_global_ref(&inner.char)?;
+            Ok(ResOnStop { gatt, char })
+        })?;
         inner
             .notify
             .subscribe(
+                GattTree::jni_with_locked_gatt(None, &self.dev_id, move |conn, env| {
+                    conn.gatt
+                        .set_characteristic_notification(env, &inner_2.char, true)?
+                        .non_false()
+                }),
                 move || {
-                    jni_with_env(|env| {
-                        let gatt = conn.gatt.as_ref(env);
-                        let gatt = Monitor::new(&gatt);
-                        let result =
-                            gatt.setCharacteristicNotification(inner_2.char.as_ref(env), true)?;
-                        result.non_false()
-                    })
-                },
-                move || {
-                    jni_with_env(|env| {
-                        let gatt = gatt_for_stop.as_ref(env);
-                        let gatt = Monitor::new(&gatt);
-                        let _ =
-                            gatt.setCharacteristicNotification(char_for_stop.as_ref(env), false);
-                    })
+                    let _ = post_to_main_looper(move |env| {
+                        let res_on_stop = res_on_stop;
+                        let _lock_gatt = env.lock_obj(&res_on_stop.gatt)?;
+                        res_on_stop.gatt.set_characteristic_notification(
+                            env,
+                            &res_on_stop.char,
+                            false,
+                        )?;
+                        Ok(())
+                    });
                 },
             )
             .await

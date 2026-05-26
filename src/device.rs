@@ -2,25 +2,24 @@ use std::sync::{Arc, OnceLock};
 
 use futures_core::Stream;
 use futures_lite::StreamExt;
-use java_spaghetti::Global;
+use jni::{objects::Global, Env};
 use log::info;
 use uuid::Uuid;
 
-use super::bindings::android::bluetooth::BluetoothDevice;
-use super::error::ErrorKind;
-use super::event_receiver::GlobalEvent;
-use super::gatt_tree::{CachedWeak, GattConnection, GattTree};
-use super::jni::Monitor;
-use super::service::Service;
-use super::util::{BoolExt, OptionExt};
-use super::vm_context::{android_api_level, jni_with_env};
-use super::{DeviceId, Result};
+use crate::bindings;
+use crate::error::ErrorKind;
+use crate::event_receiver::EventReceiver;
+use crate::event_receiver::GlobalEvent;
+use crate::gatt_tree::{GattConnection, GattTree};
+use crate::service::Service;
+use crate::util::{android_api_level, jni_with_env, BoolExt, CachedWeak, OptionExt};
+use crate::{DeviceId, Result};
 
 /// A Bluetooth LE device.
 #[derive(Clone)]
 pub struct Device {
     pub(super) id: DeviceId,
-    pub(super) device: Global<BluetoothDevice>,
+    pub(super) device: Arc<Global<bindings::BluetoothDevice<'static>>>,
     pub(super) connection: CachedWeak<GattConnection>,
     pub(super) once_connected: Arc<OnceLock<()>>,
 }
@@ -55,6 +54,32 @@ impl std::fmt::Display for Device {
 }
 
 impl Device {
+    /// Creates the `Device` from the Java `BluetoothDevice`.
+    ///
+    /// NOTE: set `once_connected` to `true` if the device has/had been connected,
+    /// this makes a future `connect_device` call to discover services automatically,
+    /// validating possible GATT tree API objects again upon reconnection.
+    pub(crate) fn from_java<'env: 'local, 'local>(
+        env: &mut Env<'env>,
+        dev: &bindings::BluetoothDevice<'local>,
+        mut once_connected: bool,
+    ) -> Result<Self, jni::errors::Error> {
+        let id = DeviceId::from_java_dev(env, dev)?;
+        if GattTree::find_connection(&id).is_some() {
+            once_connected = true; // this is unlikely to happen
+        }
+        Ok(Self {
+            id,
+            device: Arc::new(env.new_global_ref(dev)?),
+            connection: CachedWeak::new(),
+            once_connected: if once_connected {
+                Arc::new(OnceLock::from(()))
+            } else {
+                Arc::new(OnceLock::new())
+            },
+        })
+    }
+
     /// Returns this device’s unique identifier.
     pub fn id(&self) -> DeviceId {
         self.id.clone()
@@ -63,12 +88,8 @@ impl Device {
     /// The local name for this device.
     pub fn name(&self) -> Result<String> {
         jni_with_env(|env| {
-            self.device
-                .as_ref(env)
-                .getName()
-                .map_err(|e| e.into())
-                .and_then(|s| s.non_null())
-                .map(|s| s.to_string_lossy())
+            let name = self.device.get_name(env)?;
+            Ok(name.to_string())
         })
     }
 
@@ -87,56 +108,42 @@ impl Device {
     /// The pairing status for this device.
     pub async fn is_paired(&self) -> Result<bool> {
         jni_with_env(|env| {
-            self.device
-                .as_ref(env)
-                .getBondState()
-                .map_err(|e| e.into())
-                .map(|i| i == BluetoothDevice::BOND_BONDED)
+            let bond_state = self.device.get_bond_state(env)?;
+            Ok(bond_state == bindings::BluetoothDevice::BOND_BONDED)
         })
     }
 
     /// Attempt to pair this device using the system default pairing UI.
     pub async fn pair(&self) -> Result<()> {
-        let conn = self.get_connection()?;
-        let mut receiver = self
-            .get_connection()?
-            .global_event_receiver
-            .subscribe()
-            .await?;
+        let mut receiver = EventReceiver::subscribe().await?;
 
-        let bond_state = jni_with_env(|env| {
-            let device = self.device.as_ref(env);
-            device.getBondState().map_err(crate::Error::from)
-        })?;
+        let bond_state = jni_with_env(|env| Ok(self.device.get_bond_state(env)?))?;
         match bond_state {
-            BluetoothDevice::BOND_BONDED => return Ok(()),
-            BluetoothDevice::BOND_BONDING => (),
+            bindings::BluetoothDevice::BOND_BONDED => return Ok(()),
+            bindings::BluetoothDevice::BOND_BONDING => (),
             _ => {
-                jni_with_env(|env| {
-                    let device = self.device.as_ref(env);
-                    let gatt = conn.gatt.as_ref(env);
-                    let _lock = Monitor::new(&gatt);
-                    device.createBond()?.non_false()?;
-                    Ok::<_, crate::Error>(())
-                })?;
+                GattTree::jni_with_locked_gatt(None, &self.id, move |conn, env| {
+                    let device = conn.gatt.get_device(env)?;
+                    device.create_bond(env)?.non_false()
+                })
+                .await?;
             }
         }
-        drop(conn);
 
         // Inspired by <https://github.com/NordicSemiconductor/Android-BLE-Library>, BleManagerHandler.java
         while let Some(event) = receiver.next().await {
             match event {
                 GlobalEvent::BondStateChanged(dev_id, prev_st, st) if dev_id == self.id => match st
                 {
-                    BluetoothDevice::BOND_BONDED => return Ok(()),
-                    BluetoothDevice::BOND_NONE => {
-                        if prev_st == BluetoothDevice::BOND_BONDING {
+                    bindings::BluetoothDevice::BOND_BONDED => return Ok(()),
+                    bindings::BluetoothDevice::BOND_NONE => {
+                        if prev_st == bindings::BluetoothDevice::BOND_BONDING {
                             return Err(crate::Error::new(
                                 ErrorKind::NotAuthorized,
                                 None,
                                 "pairing process failed",
                             ));
-                        } else if prev_st == BluetoothDevice::BOND_BONDED {
+                        } else if prev_st == bindings::BluetoothDevice::BOND_BONDED {
                             info!("deregistered connection with {dev_id} in Device::pair");
                             GattTree::deregister_connection(&dev_id);
                             return Err(ErrorKind::NotConnected.into());
@@ -154,12 +161,10 @@ impl Device {
     pub async fn discover_services(&self) -> Result<Vec<Service>> {
         let conn = self.get_connection()?;
         let disc_lock = conn.discover_services.lock().await;
-        jni_with_env(|env| {
-            let gatt = conn.gatt.as_ref(env);
-            let gatt = Monitor::new(&gatt);
-            gatt.discoverServices()?.non_false()?;
-            Ok::<_, crate::Error>(())
-        })?;
+        GattTree::jni_with_locked_gatt(None, &self.id, |conn, env| {
+            conn.gatt.discover_services(env)?.non_false()
+        })
+        .await?;
         drop(conn);
         disc_lock.wait_unlock().await.ok_or_check_conn(&self.id)??;
         self.collect_discovered_services()
@@ -214,7 +219,7 @@ impl Device {
         let receiver = self
             .get_connection()?
             .services_changes
-            .subscribe(|| Ok::<_, crate::Error>(()), || ())
+            .subscribe(async { Ok::<_, crate::Error>(()) }, || ())
             .await?;
         Ok(receiver.map(|_| {
             Ok(ServicesChanged {
@@ -227,12 +232,10 @@ impl Device {
     pub async fn rssi(&self) -> Result<i16> {
         let conn = self.get_connection()?;
         let read_rssi_lock = conn.read_rssi.lock().await;
-        jni_with_env(|env| {
-            let gatt = conn.gatt.as_ref(env);
-            let gatt = Monitor::new(&gatt);
-            gatt.readRemoteRssi()?.non_false()?;
-            Ok::<_, crate::Error>(())
-        })?;
+        GattTree::jni_with_locked_gatt(None, &self.id, |conn, env| {
+            conn.gatt.read_remote_rssi(env)?.non_false()
+        })
+        .await?;
         drop(conn);
         read_rssi_lock
             .wait_unlock()
@@ -252,8 +255,8 @@ impl Device {
         if self.get_connection().is_ok() {
             warn!("trying to open L2CAP channel while there is a GATT connection.");
         }
-        let (reader, writer) =
-            super::l2cap_channel::open_l2cap_channel(self.device.clone(), psm, secure)?;
+        let device = jni_with_env(|env| Ok(env.new_global_ref(self.device.as_ref())?))?;
+        let (reader, writer) = super::l2cap_channel::open_l2cap_channel(device, psm, secure)?;
         Ok(super::l2cap_channel::L2capChannel { reader, writer })
     }
 

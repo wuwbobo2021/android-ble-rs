@@ -1,18 +1,18 @@
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::ops::Deref;
+use std::sync::OnceLock;
 
-use java_spaghetti::{Env, Global, Ref};
+use jni::{objects::JString, refs::Reference, Env};
+use jni_min_helper::{BroadcastReceiver, Intent, IntentFilter};
 use log::{error, info};
 
-use super::async_util::{Notifier, NotifierReceiver};
-use super::bindings::android::bluetooth::{BluetoothAdapter, BluetoothDevice};
-use super::bindings::android::content::{BroadcastReceiver, Context, Intent, IntentFilter};
-use super::bindings::java::lang::{Class, String as JString};
-use super::gatt_tree::GattTree;
-use super::vm_context::{android_api_level, android_context, jni_with_env};
-use super::{util::OptionExt, DeviceId};
+use crate::async_util::{Notifier, NotifierReceiver};
+use crate::bindings;
+use crate::gatt_tree::GattTree;
+use crate::util::{jni_with_env, ReferenceExt};
+use crate::DeviceId;
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum GlobalEvent {
     /// contains EXTRA_STATE
     AdapterStateChanged(i32),
@@ -25,189 +25,159 @@ pub enum GlobalEvent {
     BondStateChanged(DeviceId, i32, i32),
 }
 
-static GLOBAL_RECEIVER: Mutex<Weak<EventReceiver>> = Mutex::new(Weak::new());
+static GLOBAL_STORE: OnceLock<EventReceiverInner> = OnceLock::new();
 
-pub struct EventReceiver {
+static RELEVANT_ACTIONS: &[&str] = &[
+    bindings::BluetoothAdapter::ACTION_STATE_CHANGED,
+    bindings::BluetoothAdapter::ACTION_DISCOVERY_FINISHED,
+    bindings::BluetoothDevice::ACTION_ACL_CONNECTED,
+    bindings::BluetoothDevice::ACTION_ACL_DISCONNECTED,
+    bindings::BluetoothDevice::ACTION_BOND_STATE_CHANGED,
+];
+
+pub struct EventReceiver;
+
+struct EventReceiverInner {
     notifier: Notifier<GlobalEvent>,
-    java_receiver: OnceLock<Global<BroadcastReceiver>>,
+    java_receiver: BroadcastReceiver,
+}
+
+impl EventReceiverInner {
+    fn get() -> Result<&'static Self, crate::Error> {
+        if GLOBAL_STORE.get().is_none() {
+            let notifier = Notifier::new(128);
+            let java_receiver = BroadcastReceiver::build(move |env, _, intent| {
+                let notifier = &GLOBAL_STORE.get().unwrap().notifier;
+                on_receive(notifier, env, intent)
+            })?;
+            let _ = GLOBAL_STORE.set(Self {
+                notifier,
+                java_receiver,
+            });
+        }
+        Ok(GLOBAL_STORE.get().unwrap())
+    }
 }
 
 impl EventReceiver {
-    pub fn build() -> Result<Arc<Self>, crate::Error> {
-        let mut global_rec = GLOBAL_RECEIVER.lock().unwrap();
-        if let Some(rec) = global_rec.upgrade() {
-            return Ok(rec);
-        }
-        let event_receiver = Arc::new(Self {
-            notifier: Notifier::new(128),
-            java_receiver: OnceLock::new(),
-        });
-        let event_receiver_weak = Arc::downgrade(&event_receiver);
-        let proxy = Arc::new(BroadcastReceiverProxy {
-            rec_hdl: event_receiver_weak,
-        });
-        let java_receiver = jni_with_env(|env| {
-            Ok::<_, crate::Error>(BroadcastReceiver::new_proxy(env, proxy)?.as_global())
-        })?;
-        let _ = event_receiver.java_receiver.set(java_receiver);
-        *global_rec = Arc::downgrade(&event_receiver);
-        Ok(event_receiver)
-    }
-
-    pub async fn subscribe(&self) -> Result<NotifierReceiver<GlobalEvent>, crate::Error> {
-        let java_receiver = self.java_receiver.get().unwrap().clone();
-        let java_receiver_2 = self.java_receiver.get().unwrap().clone();
-        self.notifier
+    pub async fn subscribe() -> Result<NotifierReceiver<GlobalEvent>, crate::Error> {
+        EventReceiverInner::get()?
+            .notifier
             .subscribe(
-                move || {
+                async move {
                     jni_with_env(|env| {
                         let filter = IntentFilter::new(env)?;
-                        for action in [
-                            BluetoothAdapter::ACTION_STATE_CHANGED,
-                            BluetoothAdapter::ACTION_DISCOVERY_FINISHED,
-                            BluetoothDevice::ACTION_ACL_CONNECTED,
-                            BluetoothDevice::ACTION_ACL_DISCONNECTED,
-                            BluetoothDevice::ACTION_BOND_STATE_CHANGED,
-                        ] {
-                            let action_jstring = JString::from_env_str(env, action);
-                            filter.addAction(&action_jstring)?;
+                        for action in RELEVANT_ACTIONS {
+                            let action = JString::new(env, action)?;
+                            filter.add_action(env, &action)?;
                         }
+                        let inner = EventReceiverInner::get()?;
                         info!("registering the global bluetooth event broadcast receiver.");
-                        android_context()
-                            .as_ref(env)
-                            .registerReceiver_BroadcastReceiver_IntentFilter(
-                                java_receiver.as_ref(env),
-                                &filter,
-                            )
-                            .map_err(|e| e.into())
-                            .map(|_| ())
+                        inner.java_receiver.register(&filter)?;
+                        Ok(())
                     })
                 },
-                move || {
-                    jni_with_env(|env| {
+                || {
+                    let _ = jni_with_env(|_| {
+                        let inner = EventReceiverInner::get()?;
                         info!("deregistering the global bluetooth event broadcast receiver.");
-                        let _ = android_context()
-                            .as_ref(env)
-                            .unregisterReceiver(java_receiver_2.as_ref(env));
-                    })
+                        inner.java_receiver.unregister()?;
+                        Ok(())
+                    });
                 },
             )
             .await
     }
 }
 
-struct BroadcastReceiverProxy {
-    rec_hdl: Weak<EventReceiver>,
-}
-
-impl super::callback::BroadcastReceiverProxy for BroadcastReceiverProxy {
-    // NOTE: events for non-GATT profile devices may be received.
-    fn onReceive<'env>(
-        &self,
-        env: Env<'env>,
-        _context: Option<Ref<'env, Context>>,
-        intent: Option<Ref<'env, Intent>>,
-    ) {
-        let Some(rec_hdl) = self.rec_hdl.upgrade() else {
-            return;
-        };
-        let Some(intent) = intent else {
-            return;
-        };
-        let get_action = |intent: &Ref<'_, Intent>| {
-            Ok::<_, crate::Error>(intent.getAction()?.non_null()?.to_string_lossy())
-        };
-        let Ok(action) = get_action(&intent) else {
-            error!("failed to get the action string of the received intent");
-            return;
-        };
-        let process_intent = move || match action.trim() {
-            BluetoothAdapter::ACTION_STATE_CHANGED => {
-                let extra_state = JString::from_env_str(env, BluetoothAdapter::EXTRA_STATE);
-                let val = intent.getIntExtra(&extra_state, 0)?;
-                if val == BluetoothAdapter::STATE_OFF {
-                    // XXX: or STATE_TURNING_OFF?
-                    if GattTree::clear_connections() {
-                        info!("deregistered all connections in BroadcastReceiverProxy");
-                    }
+fn on_receive<'local>(
+    notifier: &Notifier<GlobalEvent>,
+    env: &mut Env<'local>,
+    intent: Intent<'local>,
+) -> Result<(), jni::errors::Error> {
+    let Some(intent) = intent.to_option() else {
+        return Ok(());
+    };
+    let mut get_action =
+        |intent: &Intent<'_>| Ok::<_, crate::Error>(intent.get_action(env)?.to_string());
+    let Ok(action) = get_action(&intent) else {
+        error!("failed to get the action string of the received intent");
+        return Ok(());
+    };
+    let mut process_intent = || match action.trim() {
+        bindings::BluetoothAdapter::ACTION_STATE_CHANGED => {
+            let extra_state = bindings::BluetoothAdapter::EXTRA_STATE(env)?;
+            let val = intent.get_int_extra(env, &extra_state, 0)?;
+            if val == bindings::BluetoothAdapter::STATE_OFF {
+                // XXX: or STATE_TURNING_OFF?
+                if GattTree::clear_connections() {
+                    info!("deregistered all connections in BroadcastReceiverProxy");
                 }
-                rec_hdl
-                    .notifier
-                    .notify(GlobalEvent::AdapterStateChanged(val));
-                Ok::<_, crate::Error>(())
             }
-            BluetoothAdapter::ACTION_DISCOVERY_FINISHED => {
-                rec_hdl.notifier.notify(GlobalEvent::DiscoveryFinished);
-                Ok::<_, crate::Error>(())
-            }
-            BluetoothDevice::ACTION_ACL_CONNECTED => {
-                let extra_transport = JString::from_env_str(env, BluetoothDevice::EXTRA_TRANSPORT);
-                let transport = intent.getIntExtra(&extra_transport, 0)?;
-                if transport == BluetoothDevice::TRANSPORT_LE {
-                    let dev_id = get_extra_device_id(&intent)?;
-                    rec_hdl
-                        .notifier
-                        .notify(GlobalEvent::AclConnectionStateChanged(dev_id, true));
-                }
-                Ok(())
-            }
-            BluetoothDevice::ACTION_ACL_DISCONNECTED => {
-                let extra_transport = JString::from_env_str(env, BluetoothDevice::EXTRA_TRANSPORT);
-                let transport = intent.getIntExtra(&extra_transport, 0)?;
-                if transport == BluetoothDevice::TRANSPORT_LE {
-                    let dev_id = get_extra_device_id(&intent)?;
-                    if GattTree::deregister_connection(&dev_id) {
-                        info!("deregistered connection with {dev_id} in BroadcastReceiverProxy");
-                    }
-                    rec_hdl
-                        .notifier
-                        .notify(GlobalEvent::AclConnectionStateChanged(dev_id, false));
-                }
-                Ok(())
-            }
-            BluetoothDevice::ACTION_BOND_STATE_CHANGED => {
-                let dev_id = get_extra_device_id(&intent)?;
-                let extra_prev_bond_state =
-                    JString::from_env_str(env, BluetoothDevice::EXTRA_PREVIOUS_BOND_STATE);
-                let prev_bond_state = intent.getIntExtra(&extra_prev_bond_state, 0)?;
-                let extra_bond_state =
-                    JString::from_env_str(env, BluetoothDevice::EXTRA_BOND_STATE);
-                let bond_state = intent.getIntExtra(&extra_bond_state, 0)?;
-                rec_hdl.notifier.notify(GlobalEvent::BondStateChanged(
-                    dev_id,
-                    prev_bond_state,
-                    bond_state,
-                ));
-                Ok(())
-            }
-            _ => Ok(()),
-        };
-        if let Err(e) = process_intent() {
-            error!("failed to get the extra value of the received intent: {e}");
+            notifier.notify(GlobalEvent::AdapterStateChanged(val));
+            Ok::<(), crate::Error>(())
         }
+        bindings::BluetoothAdapter::ACTION_DISCOVERY_FINISHED => {
+            notifier.notify(GlobalEvent::DiscoveryFinished);
+            Ok(())
+        }
+        bindings::BluetoothDevice::ACTION_ACL_CONNECTED => {
+            let extra_transport = bindings::BluetoothDevice::EXTRA_TRANSPORT(env)?;
+            let transport = intent.get_int_extra(env, &extra_transport, 0)?;
+            if transport == bindings::BluetoothDevice::TRANSPORT_LE {
+                let dev_id = get_extra_device_id(env, &intent)?;
+                notifier.notify(GlobalEvent::AclConnectionStateChanged(dev_id, true));
+            }
+            Ok(())
+        }
+        bindings::BluetoothDevice::ACTION_ACL_DISCONNECTED => {
+            let extra_transport = bindings::BluetoothDevice::EXTRA_TRANSPORT(env)?;
+            let transport = intent.get_int_extra(env, &extra_transport, 0)?;
+            if transport == bindings::BluetoothDevice::TRANSPORT_LE {
+                let dev_id = get_extra_device_id(env, &intent)?;
+                if GattTree::deregister_connection(&dev_id) {
+                    info!("deregistered connection with {dev_id} in BroadcastReceiverProxy");
+                }
+                notifier.notify(GlobalEvent::AclConnectionStateChanged(dev_id, false));
+            }
+            Ok(())
+        }
+        bindings::BluetoothDevice::ACTION_BOND_STATE_CHANGED => {
+            let dev_id = get_extra_device_id(env, &intent)?;
+            let extra_prev_bond_state = bindings::BluetoothDevice::EXTRA_PREVIOUS_BOND_STATE(env)?;
+            let prev_bond_state = intent.get_int_extra(env, &extra_prev_bond_state, 0)?;
+            let extra_bond_state = bindings::BluetoothDevice::EXTRA_BOND_STATE(env)?;
+            let bond_state = intent.get_int_extra(env, &extra_bond_state, 0)?;
+            notifier.notify(GlobalEvent::BondStateChanged(
+                dev_id,
+                prev_bond_state,
+                bond_state,
+            ));
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    if let Err(e) = process_intent() {
+        error!("failed to get the extra value of the received intent: {e}");
     }
+    Ok(())
 }
 
-fn get_extra_device_id(intent: &Ref<'_, Intent>) -> Result<DeviceId, crate::Error> {
-    let env = intent.env();
-    let extra_device = JString::from_env_str(env, BluetoothDevice::EXTRA_DEVICE);
-    let device = if android_api_level() >= 33 {
-        let class_device = unsafe {
-            java_spaghetti::Local::<Class>::from_raw(
-                env,
-                env.require_class("android/bluetooth/BluetoothDevice\0"),
-            )
-        };
-        intent
-            .getParcelableExtra_String_Class(&extra_device, &class_device)?
-            .and_then(|o| o.cast::<BluetoothDevice>().ok())
-    } else {
-        #[allow(deprecated)]
-        intent
-            .getParcelableExtra_String(&extra_device)?
-            .and_then(|o| o.cast::<BluetoothDevice>().ok())
+fn get_extra_device_id<'local>(
+    env: &mut Env<'local>,
+    intent: &Intent<'local>,
+) -> Result<DeviceId, crate::Error> {
+    let extra_device = bindings::BluetoothDevice::EXTRA_DEVICE(env)?;
+    let device_class =
+        bindings::BluetoothDevice::lookup_class(env, &jni::objects::LoaderContext::None)?;
+    let device = intent.get_parcelable_extra(env, &extra_device, device_class.deref())?;
+    if device.is_null() {
+        return Err(crate::Error::new(
+            crate::error::ErrorKind::Internal,
+            None,
+            "failed to get EXTRA_DEVICE from received intent",
+        ));
     }
-    .non_null()?;
-    let addr = device.getAddress()?.non_null()?.to_string_lossy();
-    Ok(DeviceId(addr))
+    let device = env.as_cast::<bindings::BluetoothDevice>(&device)?;
+    Ok(DeviceId::from_java_dev(env, device)?)
 }
