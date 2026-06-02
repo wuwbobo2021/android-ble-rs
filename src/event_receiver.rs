@@ -8,7 +8,7 @@ use log::{error, info};
 use crate::async_util::{Notifier, NotifierReceiver};
 use crate::bindings;
 use crate::gatt_tree::GattTree;
-use crate::util::{jni_with_env, ReferenceExt};
+use crate::util::{android_api_level, jni_with_env, ReferenceExt};
 use crate::DeviceId;
 
 #[allow(clippy::enum_variant_names)]
@@ -19,7 +19,7 @@ pub enum GlobalEvent {
     /// `Adapter::scan` should return when this event is received
     DiscoveryFinished,
     /// contains device address
-    #[allow(unused)] // NOTE: this may not be received; this can be removed.
+    #[allow(unused)] // NOTE: this may not be received
     AclConnectionStateChanged(DeviceId, bool),
     /// contains device address, EXTRA_PREVIOUS_BOND_STATE, and EXTRA_BOND_STATE
     BondStateChanged(DeviceId, i32, i32),
@@ -122,24 +122,32 @@ fn on_receive<'local>(
             Ok(())
         }
         bindings::BluetoothDevice::ACTION_ACL_CONNECTED => {
-            let extra_transport = bindings::BluetoothDevice::EXTRA_TRANSPORT(env)?;
-            let transport = intent.get_int_extra(env, &extra_transport, 0)?;
-            if transport == bindings::BluetoothDevice::TRANSPORT_LE {
-                let dev_id = get_extra_device_id(env, &intent)?;
-                notifier.notify(GlobalEvent::AclConnectionStateChanged(dev_id, true));
+            if android_api_level() >= 33 {
+                let extra_transport =
+                    JString::new(env, bindings::BluetoothDevice::EXTRA_TRANSPORT)?;
+                let transport = intent.get_int_extra(env, &extra_transport, 0)?;
+                if transport != bindings::BluetoothDevice::TRANSPORT_LE {
+                    return Ok(());
+                }
             }
+            let dev_id = get_extra_device_id(env, &intent)?;
+            notifier.notify(GlobalEvent::AclConnectionStateChanged(dev_id, true));
             Ok(())
         }
         bindings::BluetoothDevice::ACTION_ACL_DISCONNECTED => {
-            let extra_transport = bindings::BluetoothDevice::EXTRA_TRANSPORT(env)?;
-            let transport = intent.get_int_extra(env, &extra_transport, 0)?;
-            if transport == bindings::BluetoothDevice::TRANSPORT_LE {
-                let dev_id = get_extra_device_id(env, &intent)?;
-                if GattTree::deregister_connection(&dev_id) {
-                    info!("deregistered connection with {dev_id} in BroadcastReceiverProxy");
+            if android_api_level() >= 33 {
+                let extra_transport =
+                    JString::new(env, bindings::BluetoothDevice::EXTRA_TRANSPORT)?;
+                let transport = intent.get_int_extra(env, &extra_transport, 0)?;
+                if transport != bindings::BluetoothDevice::TRANSPORT_LE {
+                    return Ok(());
                 }
-                notifier.notify(GlobalEvent::AclConnectionStateChanged(dev_id, false));
             }
+            let dev_id = get_extra_device_id(env, &intent)?;
+            if GattTree::deregister_connection(&dev_id) {
+                info!("deregistered connection with {dev_id} in BroadcastReceiverProxy");
+            }
+            notifier.notify(GlobalEvent::AclConnectionStateChanged(dev_id, false));
             Ok(())
         }
         bindings::BluetoothDevice::ACTION_BOND_STATE_CHANGED => {

@@ -76,8 +76,8 @@ bind_java_type! {
 bind_java_type! {
     pub UUID => "java.util.UUID",
     methods {
-        static fn from_string(arg0: JString) -> UUID,
-        fn to_string() -> JString,
+        non_null static fn from_string(arg0: JString) -> UUID,
+        non_null fn to_string() -> JString,
     }
 }
 
@@ -127,16 +127,16 @@ bind_java_type! {
 bind_java_type! {
     pub ParcelUuid => "android.os.ParcelUuid",
     methods {
-        static fn from_string(arg0: JString) -> ParcelUuid,
-        fn to_string() -> JString,
+        non_null static fn from_string(arg0: JString) -> ParcelUuid,
+        non_null fn to_string() -> JString,
     },
 }
 
 bind_java_type! {
     pub Looper => "android.os.Looper",
     methods {
-        static fn get_main_looper() -> Looper,
-        fn get_thread() -> JThread,
+        non_null static fn get_main_looper() -> Looper,
+        non_null fn get_thread() -> JThread,
     }
 }
 
@@ -145,9 +145,6 @@ bind_java_type! {
     type_map = {
         BluetoothAdapter => "android.bluetooth.BluetoothAdapter",
         BluetoothDevice => "android.bluetooth.BluetoothDevice",
-    },
-    constructors {
-        fn new(),
     },
     methods {
         non_null fn get_adapter() -> BluetoothAdapter,
@@ -217,11 +214,6 @@ bind_java_type! {
             get = EXTRA_DEVICE,
         },
         #[allow(non_snake_case)]
-        static EXTRA_TRANSPORT {
-            sig = JString,
-            get = EXTRA_TRANSPORT,
-        },
-        #[allow(non_snake_case)]
         static EXTRA_BOND_STATE {
             sig = JString,
             get = EXTRA_BOND_STATE,
@@ -260,6 +252,8 @@ impl<'a> BluetoothDevice<'a> {
     pub const BOND_BONDING: i32 = 11;
     pub const BOND_NONE: i32 = 10;
     pub const TRANSPORT_LE: i32 = 2;
+    // XXX: This is added in API level 33
+    pub const EXTRA_TRANSPORT: &'static str = "android.bluetooth.device.extra.TRANSPORT";
 }
 
 bind_java_type! {
@@ -389,8 +383,6 @@ bind_java_type! {
         BluetoothDevice => "android.bluetooth.BluetoothDevice",
         BluetoothGattCharacteristic => "android.bluetooth.BluetoothGattCharacteristic",
         BluetoothGattDescriptor => "android.bluetooth.BluetoothGattDescriptor",
-        BluetoothGattNewApi => "android.bluetooth.BluetoothGatt",
-        BluetoothGattOldApi => "android.bluetooth.BluetoothGatt",
     },
     methods {
         non_null fn get_device() -> BluetoothDevice,
@@ -404,12 +396,26 @@ bind_java_type! {
         fn disconnect(),
         fn close(),
     },
-    is_instance_of = {
-        new_api: BluetoothGattNewApi,
-        old_api: BluetoothGattOldApi,
+}
+
+// XXX: <https://github.com/jni-rs/jni-rs/issues/821> explains why such `unsafe`
+// blocks are needed for avoiding runtime checks under this purpose.
+impl<'local> BluetoothGatt<'local> {
+    pub fn as_new_api<'env: 'local>(
+        &self,
+        env: &jni::Env<'env>,
+    ) -> jni::objects::Cast<'_, '_, BluetoothGattNewApi<'local>> {
+        unsafe { env.as_cast_unchecked::<BluetoothGattNewApi>(self) }
+    }
+    pub fn as_old_api<'env: 'local>(
+        &self,
+        env: &jni::Env<'env>,
+    ) -> jni::objects::Cast<'_, '_, BluetoothGattOldApi<'local>> {
+        unsafe { env.as_cast_unchecked::<BluetoothGattOldApi>(self) }
     }
 }
 
+// XXX
 bind_java_type! {
     pub BluetoothGattNewApi => "android.bluetooth.BluetoothGatt",
     type_map = {
@@ -475,7 +481,6 @@ impl<'a> BluetoothGattService<'a> {
 bind_java_type! {
     pub BluetoothGattCharacteristic => "android.bluetooth.BluetoothGattCharacteristic",
     type_map = {
-        BluetoothGattCharacteristicOldApi => "android.bluetooth.BluetoothGattCharacteristic",
         UUID => "java.util.UUID",
         BluetoothGattService => "android.bluetooth.BluetoothGattService",
     },
@@ -486,8 +491,15 @@ bind_java_type! {
         fn get_properties() -> jint,
         fn set_write_type(arg0: jint),
     },
-    is_instance_of = {
-        old_api: BluetoothGattCharacteristicOldApi,
+}
+
+// XXX
+impl<'local> BluetoothGattCharacteristic<'local> {
+    pub fn as_old_api<'env: 'local>(
+        &self,
+        env: &jni::Env<'env>,
+    ) -> jni::objects::Cast<'_, '_, BluetoothGattCharacteristicOldApi<'local>> {
+        unsafe { env.as_cast_unchecked::<BluetoothGattCharacteristicOldApi>(self) }
     }
 }
 
@@ -511,7 +523,6 @@ impl<'a> BluetoothGattCharacteristic<'a> {
 bind_java_type! {
     pub BluetoothGattDescriptor => "android.bluetooth.BluetoothGattDescriptor",
     type_map = {
-        BluetoothGattDescriptorOldApi => "android.bluetooth.BluetoothGattDescriptor",
         UUID => "java.util.UUID",
         BluetoothGattCharacteristic => "android.bluetooth.BluetoothGattCharacteristic",
     },
@@ -519,9 +530,16 @@ bind_java_type! {
         non_null fn get_uuid() -> UUID,
         non_null fn get_characteristic() -> BluetoothGattCharacteristic,
     },
-    is_instance_of = {
-        old_api: BluetoothGattDescriptorOldApi,
-    },
+}
+
+// XXX
+impl<'local> BluetoothGattDescriptor<'local> {
+    pub fn as_old_api<'env: 'local>(
+        &self,
+        env: &jni::Env<'env>,
+    ) -> jni::objects::Cast<'_, '_, BluetoothGattDescriptorOldApi<'local>> {
+        unsafe { env.as_cast_unchecked::<BluetoothGattDescriptorOldApi>(self) }
+    }
 }
 
 // XXX

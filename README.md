@@ -6,11 +6,16 @@ A few portions of the code (especially `L2capChannel`) is orginally written by
 [Dirbaio](https://github.com/Dirbaio).
 
 Version 0.2.x of this crate is supposed to be API-compatible with version 0.6.x of
-the [bluest](https://docs.rs/crate/bluest/0.6.9) library. In fact, some type definitions
-are copied from `bluest`. Anything incompatible with `bluest` in the API may be reported as a bug.
+the [bluest](https://docs.rs/crate/bluest/0.6.9) library. In fact, some type
+definitions are copied from `bluest`. Anything incompatible with `bluest` 0.6.x
+in the API may be reported as a bug, except `Adapter::default` which is changed
+according to the main branch version of `bluest`.
 
-This crate uses [ndk_context](https://crates.io/crates/ndk-context), which is automatically
-initialized in [android_activity](https://crates.io/crates/android_activity).
+Supported Android versions: Android 7.0 and above.
+
+This crate uses [ndk_context](https://crates.io/crates/ndk-context), which is
+automatically initialized in
+[android_activity](https://crates.io/crates/android_activity).
 
 ## Test
 
@@ -18,15 +23,20 @@ Make sure the Android SDK, NDK, Rust target `aarch64-linux-android` and
 [cargo-apk](https://crates.io/crates/cargo-apk) are installed.
 Note that [cargo-apk2](https://crates.io/crates/cargo-apk2) can also be used.
 
-Create `android-ble-test` according to the template provided below, and build it with `cargo apk build -r`.
-Note: `-r` means building for the release profile, which produces a much smaller package.
+Create `android-ble-test` according to the template provided below, and build it
+with `cargo apk build -r`.
 
-Install the `target/release/apk/android-ble-test.apk` on the Android device, and enable permissions
-manually on the device.
+(`-r` means building for the release profile, which produces a much smaller package.)
 
-Start the `android-ble-test` on the device, then check the log output with `adb logcat android_ble_test:D '*:S'`.
+Install the `target/release/apk/android-ble-test.apk` on the Android device, and
+enable permissions manually on the device.
 
-### `cargo-apk` template
+Start the `android-ble-test` on the device, then check the log output with
+`adb logcat android_ble_test:D '*:S'`.
+
+<details>
+
+<summary>`cargo-apk` template</summary>
 
 `Cargo.toml`:
 
@@ -39,11 +49,11 @@ publish = false
 
 [dependencies]
 log = "0.4"
-android-ble = "0.1"
+android-ble = "0.2"
 android_logger = "0.15.1"
 ndk-context = "0.1.1"
-android-activity = { version = "0.6", features = ["native-activity"] }
-# jni-min-helper = { version = "0.3", features = ["futures"] }
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+# jni-min-helper = { version = "0.4.1", features = ["futures"] }
 futures-lite = "2.6"
 async-channel = "2.2.0"
 
@@ -56,12 +66,12 @@ package = "com.example.android_ble_test"
 build_targets = ["aarch64-linux-android"]
 
 # For `cargo-apk2`:
-# put <https://docs.rs/crate/jni-min-helper/0.3.2/source/java/PermActivity.java> in this folder
+# put <https://docs.rs/crate/jni-min-helper/0.4.1/source/java/PermActivity.java> in this folder
 # java_sources = "java"
 
 # Android 12 or above may require runtime permission request. Use `cargo-apk2` for performing this.
 # <https://developer.android.com/develop/connectivity/bluetooth/bt-permissions>
-# <https://docs.rs/jni-min-helper/0.3.2/jni_min_helper/struct.PermissionRequest.html>
+# <https://docs.rs/jni-min-helper/0.4.1/jni_min_helper/struct.PermissionRequest.html>
 [package.metadata.android.sdk]
 min_sdk_version = 23
 target_sdk_version = 33
@@ -162,8 +172,24 @@ fn android_main(app: AndroidApp) {
 
 // Please put your new test case here.
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
-    // Currently this requires `cargo-apk2` instead of `cargo-apk` to work.
-    // But this is required if the user chooses to confirm permission on every startup.
+    // request_permissions().await?;
+    let adapter = bluest::Adapter::default().await?;
+    adapter.wait_available().await?;
+    info!("starting scan...");
+    let mut scan = adapter.scan(&[]).await?;
+    info!("scan started.");
+    while let Some(discovered) = scan.next().await {
+        info!("found a device...");
+        info!("{:#?}", discovered);
+    }
+    Ok(())
+}
+
+// Currently this requires `cargo-apk2` instead of `cargo-apk` to work.
+// But this is required if the user chooses to confirm permission on every startup.
+#[allow(unused)]
+async fn request_permissions() -> Result<(), Box<dyn std::error::Error>> {
+    unimplemented!()
     /*
     let perm_list = if jni_min_helper::android_api_level() >= 31 {
         vec![
@@ -184,22 +210,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         let result = req.await;
         for (perm_name, granted) in result.unwrap_or_default() {
             if !granted {
-                info!("{perm_name} is denied by the user.");
-                return Ok(());
+                return Err(format!("{perm_name} is denied by the user.").into());
             }
         }
     };
-    */
-    
-    let adapter = bluest::Adapter::default().await.ok_or("adapter is unavailable")?;
-    adapter.wait_available().await?;
-    info!("starting scan...");
-    let mut scan = adapter.scan(&[]).await?;
-    info!("scan started.");
-    while let Some(discovered) = scan.next().await {
-        info!("found a device...");
-        info!("{:?}", discovered);
-    }
     Ok(())
+    */
 }
 ```
+
+</details>

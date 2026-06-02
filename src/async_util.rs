@@ -117,10 +117,10 @@ impl<T: Send + Clone> Excluder<T> {
         let mut guard_inner = loop {
             let guard_inner = self.inner.lock().await;
             if let Some(lock_mark) = guard_inner.as_ref() {
-                if let Some(prev_id) = waited_without_tp_timeout.as_ref() {
-                    if prev_id != &lock_mark.id {
-                        let _ = waited_without_tp_timeout.take();
-                    }
+                if let Some(prev_id) = waited_without_tp_timeout.as_ref()
+                    && prev_id != &lock_mark.id
+                {
+                    let _ = waited_without_tp_timeout.take();
                 }
                 let dur_wait = if let Some(tp_timeout) = lock_mark.tp_timeout.get() {
                     if let Some(dur) = tp_timeout.checked_duration_since(Instant::now()) {
@@ -173,7 +173,8 @@ impl<T: Send + Clone> Excluder<T> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_LOCK_ID: AtomicUsize = AtomicUsize::new(0);
 
-        let (sender, receiver) = async_broadcast::broadcast(2);
+        let (mut sender, receiver) = async_broadcast::broadcast(2);
+        sender.set_await_active(false); // never wait for `sender_keeper` to become active!
         let tp_timeout = Arc::new(OnceCell::new());
         let mark = LockMark {
             id: NEXT_LOCK_ID.fetch_add(1, Ordering::SeqCst),
@@ -243,8 +244,7 @@ impl<T: Send + Clone> ResultWaiter<T> {
             .await;
         res.ok()?;
         let last_val = self.last_val.upgrade()?;
-        let val = last_val.lock().await.as_ref().cloned();
-        val
+        last_val.lock().await.as_ref().cloned()
     }
 }
 
@@ -269,9 +269,16 @@ struct NotifierInner<T: Send + Clone> {
     on_stop: Option<Box<dyn FnOnce() + Send + Sync + 'static>>, // take for once on drop
 }
 
+#[derive(Clone)]
 pub struct NotifierReceiver<T: Send + Clone> {
     holder: Option<Arc<NotifierInner<T>>>,
     receiver: Receiver<Option<T>>,
+}
+
+#[derive(Clone)]
+pub struct NotifierInactiveReceiver<T: Send + Clone> {
+    _holder: Option<Arc<NotifierInner<T>>>,
+    _receiver: InactiveReceiver<Option<T>>,
 }
 
 impl<T: Send + Clone> Notifier<T> {
@@ -309,6 +316,7 @@ impl<T: Send + Clone> Notifier<T> {
             on_start.await?;
             let (mut sender, receiver) = async_broadcast::broadcast(self.capacity);
             sender.set_overflow(true);
+            sender.set_await_active(false);
             let new_inner = Arc::new(NotifierInner {
                 sender,
                 on_stop: Some(Box::new(on_stop)),
@@ -326,6 +334,17 @@ impl<T: Send + Clone> Notifier<T> {
         let inner = self.inner.lock_blocking().upgrade();
         if let Some(inner) = inner {
             let _ = inner.sender.broadcast_blocking(Some(value));
+        }
+    }
+}
+
+impl<T: Send + Clone> NotifierReceiver<T> {
+    /// This is only useful for getting a handler that prevents the `Notifier` from
+    /// being deactivated, so that `on_stop` will not be executed.
+    pub fn deactivate(self) -> NotifierInactiveReceiver<T> {
+        NotifierInactiveReceiver {
+            _holder: self.holder,
+            _receiver: self.receiver.deactivate(),
         }
     }
 }

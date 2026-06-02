@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::characteristic::Characteristic;
 use crate::gatt_tree::{GattTree, ServiceInner};
-use crate::util::{jni_with_env, CachedWeak, OptionExt, UuidExt};
-use crate::{bindings, DeviceId, Result, Uuid};
+use crate::util::{CachedWeak, JIteratorExt, OptionExt, UuidExt, jni_with_env};
+use crate::{DeviceId, Result, Uuid, bindings};
 
 /// A Bluetooth GATT service.
 #[derive(Debug, Clone)]
@@ -112,7 +112,7 @@ impl Service {
             let includes = service.get_included_services(env)?;
             let jiter_includes = includes.iter(env)?;
             let mut vec = Vec::new();
-            while let Some(serv) = jiter_includes.next(env)? {
+            while let Some(serv) = jiter_includes.check_next(env)? {
                 let serv = env.as_cast::<bindings::BluetoothGattService>(&serv)?;
                 let uuid = serv.get_uuid(env)?;
                 let uuid = Uuid::from_java(env, &uuid)?;

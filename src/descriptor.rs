@@ -93,13 +93,13 @@ impl Descriptor {
             let array = JByteArray::from_slice(env, &value)?;
             if android_api_level() >= 33 {
                 conn.gatt
-                    .as_new_api()
+                    .as_new_api(env)
                     .write_descriptor(env, desc, array)?
                     .check_status_code()
             } else {
-                desc.as_old_api().set_value(env, array)?;
+                desc.as_old_api(env).set_value(env, array)?;
                 conn.gatt
-                    .as_old_api()
+                    .as_old_api(env)
                     .write_descriptor(env, desc)
                     .map_err(|e| e.into())
                     .and_then(|b| b.non_false())

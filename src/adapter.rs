@@ -13,8 +13,10 @@ use crate::error::ErrorKind;
 use crate::event_receiver::{EventReceiver, GlobalEvent};
 use crate::gatt_tree::{BluetoothGattCallbackProxy, GattTree};
 use crate::scanner::Scanner;
-use crate::util::{android_api_level, android_context, android_has_permission, jni_with_env};
-use crate::{callback, AdapterEvent, AdvertisingDevice, ConnectionEvent, DeviceId, Error, Result};
+use crate::util::{
+    JIteratorExt, android_api_level, android_context, android_has_permission, jni_with_env,
+};
+use crate::{AdapterEvent, AdvertisingDevice, ConnectionEvent, DeviceId, Error, Result, callback};
 
 /// The system’s Bluetooth adapter interface.
 #[derive(Clone)]
@@ -83,7 +85,9 @@ fn check_scan_permission() -> Result<(), crate::Error> {
     let has_perm = if android_api_level() >= 31 {
         if android_has_permission("android.permission.BLUETOOTH_SCAN")? {
             if !android_has_permission("android.permission.ACCESS_FINE_LOCATION")? {
-                warn!("Please ensure `neverForLocation` is included in `android:usesPermissionFlags`.")
+                warn!(
+                    "Please ensure `neverForLocation` is included in `android:usesPermissionFlags`."
+                )
             }
             true // XXX
         } else {
@@ -124,8 +128,8 @@ fn check_connection_permission() -> Result<(), crate::Error> {
 
 impl Adapter {
     /// Creates an interface to a Bluetooth adapter using the default config.
-    pub async fn default() -> Option<Self> {
-        Adapter::with_config(AdapterConfig::default()).await.ok()
+    pub async fn default() -> Result<Self, crate::Error> {
+        Adapter::with_config(AdapterConfig::default()).await
     }
 
     /// Creates an interface to a Bluetooth adapter.
@@ -136,10 +140,10 @@ impl Adapter {
             let service_name = bindings::Context::BLUETOOTH_SERVICE(env)?;
             let manager = context
                 .get_system_service(env, &service_name)
-                .map_err(|_| {
+                .map_err(|e| {
                     Error::new(
                         ErrorKind::AdapterUnavailable,
-                        None,
+                        Some(e.into()),
                         "Failed to get the system service BLUETOOTH_SERVICE",
                     )
                 })?;
@@ -192,11 +196,7 @@ impl Adapter {
 
     /// Check if the adapter is available.
     pub async fn is_available(&self) -> Result<bool> {
-        jni_with_env(|env| {
-            self.inner.adapter.is_enabled(env).map_err(|e| {
-                Error::new(ErrorKind::Internal, None, format!("isEnabled threw: {e:?}"))
-            })
-        })
+        jni_with_env(|env| Ok(self.inner.adapter.is_enabled(env)?))
     }
 
     /// Attempts to create the device identified by `id`.
@@ -231,7 +231,7 @@ impl Adapter {
                 let devices =
                     manager.get_connected_devices(env, bindings::BluetoothProfile::GATT)?;
                 let iter_devices = devices.iter(env)?;
-                while let Some(device) = iter_devices.next(env)? {
+                while let Some(device) = iter_devices.check_next(env)? {
                     let device = env.cast_local::<bindings::BluetoothDevice>(device)?;
                     let device_item = Device::from_java(env, &device, true)?;
                     device_items.push(device_item);
@@ -323,6 +323,7 @@ impl Adapter {
                 "device is connected outside the current `android_ble` library",
             ));
         }
+        let event_receiver = EventReceiver::subscribe().await?;
         let callback_hdl = BluetoothGattCallbackProxy::new(device.id());
         jni_with_env(|env| {
             let context = android_context(env);
@@ -332,7 +333,12 @@ impl Adapter {
             let proxy =
                 callback::BluetoothGattCallbackJavaProxy::new_proxy(env, callback_hdl.clone())?;
             let gatt = device_obj.connect_gatt(env, &context, false, proxy)?;
-            GattTree::register_connection(&device.id(), env.new_global_ref(gatt)?, &callback_hdl);
+            GattTree::register_connection(
+                &device.id(),
+                env.new_global_ref(gatt)?,
+                &callback_hdl,
+                &event_receiver,
+            );
             Ok(())
         })?;
         if !self.is_actually_connected(&device.id())? {
@@ -364,7 +370,14 @@ impl Adapter {
             Ok(conn.gatt.disconnect(env)?)
         })
         .await?;
-        GattTree::deregister_connection(&device.id());
+        let mut conn_events = self.device_connection_events(&device).await?;
+        if GattTree::deregister_connection(&device.id()) {
+            while let Some(event) = conn_events.next().await {
+                if event == ConnectionEvent::Disconnected {
+                    break;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -403,7 +416,7 @@ impl Adapter {
             let manager = &self.inner.manager;
             let devices = manager.get_connected_devices(env, bindings::BluetoothProfile::GATT)?;
             let jiter_devices = devices.iter(env)?;
-            while let Some(device) = jiter_devices.next(env)? {
+            while let Some(device) = jiter_devices.check_next(env)? {
                 let device = env.as_cast::<bindings::BluetoothDevice>(&device)?;
                 let addr = DeviceId::from_java_dev(env, &device)?;
                 if dev_id == &addr {

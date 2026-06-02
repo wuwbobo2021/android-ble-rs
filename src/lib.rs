@@ -1,7 +1,8 @@
 //! Android Bluetooth API wrapper, currently supporting BLE client role operations.
 //!
 //! Version 0.2.x of this crate is supposed to be API-compatible with version 0.6.x of `bluest` library.
-//! Anything incompatible with `bluest` (without the `unstable` feature) in the API may be reported as a bug.
+//! Anything incompatible with `bluest` 0.6.x (without the `unstable` feature) in the API may be reported
+//! as a bug, except `Adapter::default` which is changed according to the main branch version of `bluest`.
 //!
 //! This crate uses `ndk_context::AndroidContext`, which is automatically initialized by `android_activity`.
 //! The basic Android test template is provided in the crate page.

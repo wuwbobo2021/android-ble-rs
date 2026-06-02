@@ -2,17 +2,16 @@ use std::sync::{Arc, OnceLock};
 
 use futures_core::Stream;
 use futures_lite::StreamExt;
-use jni::{objects::Global, Env};
+use jni::{Env, objects::Global};
 use log::info;
 use uuid::Uuid;
 
 use crate::bindings;
 use crate::error::ErrorKind;
-use crate::event_receiver::EventReceiver;
-use crate::event_receiver::GlobalEvent;
+use crate::event_receiver::{EventReceiver, GlobalEvent};
 use crate::gatt_tree::{GattConnection, GattTree};
 use crate::service::Service;
-use crate::util::{android_api_level, jni_with_env, BoolExt, CachedWeak, OptionExt};
+use crate::util::{BoolExt, CachedWeak, OptionExt, android_api_level, jni_with_env};
 use crate::{DeviceId, Result};
 
 /// A Bluetooth LE device.
@@ -243,7 +242,7 @@ impl Device {
             .ok_or_check_conn(&self.id)?
     }
 
-    /// Open an L2CAP connection-oriented channel (CoC) to this device.
+    /// (**Experimental**) Open an L2CAP connection-oriented channel (CoC) to this device.
     ///
     /// This requires Android API level 29 or higher.
     pub async fn open_l2cap_channel(

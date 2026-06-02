@@ -11,7 +11,7 @@ use log::{debug, trace, warn};
 
 use crate::bindings;
 use crate::error::ErrorKind;
-use crate::util::{android_api_level, jni_with_env, JByteArrayExt, ReferenceExt};
+use crate::util::{JByteArrayExt, ReferenceExt, android_api_level, jni_with_env};
 
 const PIPE_CAPACITY: usize = 0x100000; // 1MB
 
@@ -137,7 +137,7 @@ pub fn open_l2cap_channel(
                             break;
                         }
                         Ok(len) => {
-                            let buf = jarr.to_vec(env)?;
+                            let buf = jarr.to_vec(env)?; // XXX
                             if let Err(e) = read_sender.write_all(&buf[..len as _]) {
                                 warn!("failed to enqueue received l2cap packet: {:?}", e);
                                 break;

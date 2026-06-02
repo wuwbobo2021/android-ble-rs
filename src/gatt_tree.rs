@@ -3,16 +3,19 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 
 use futures_core::Stream;
-use jni::{refs::Global, Env};
+use jni::{Env, refs::Global};
 use log::{error, info};
 
-use crate::async_util::{Excluder, Notifier, ResultWaiter};
+use crate::async_util::{
+    Excluder, Notifier, NotifierInactiveReceiver, NotifierReceiver, ResultWaiter,
+};
 use crate::bindings;
 use crate::device::Device;
 use crate::error::{AttError, Error};
+use crate::event_receiver::GlobalEvent;
 use crate::util::{
-    android_api_level, is_current_thread_main_looper, jni_with_env, post_to_main_looper, BoolExt,
-    JByteArrayExt, ReferenceExt, UuidExt,
+    BoolExt, JByteArrayExt, JIteratorExt, ReferenceExt, UuidExt, android_api_level,
+    is_current_thread_main_looper, jni_with_env, post_to_main_looper,
 };
 use crate::{Adapter, ConnectionEvent, DeviceId, Uuid};
 
@@ -30,6 +33,8 @@ pub(crate) struct GattConnection {
     pub(super) read_rssi: Excluder<Result<i16, Error>>,
     pub(super) services_changes: Notifier<()>,
     pub(super) mtu_changed_received: Excluder<usize>,
+    #[allow(unused)]
+    pub(super) global_event_receiver: NotifierInactiveReceiver<GlobalEvent>,
 }
 
 pub(crate) struct ServiceInner {
@@ -73,6 +78,7 @@ impl GattTree {
         dev_id: &DeviceId,
         gatt: Global<bindings::BluetoothGatt<'static>>,
         callback_hdl: &Arc<BluetoothGattCallbackProxy>,
+        event_receiver: &NotifierReceiver<GlobalEvent>,
     ) {
         let _ = GATT_CONNECTIONS.lock().unwrap().insert(
             dev_id.clone(),
@@ -86,6 +92,7 @@ impl GattTree {
                 read_rssi: Excluder::default(),
                 services_changes: Notifier::new(16),
                 mtu_changed_received: Excluder::default(),
+                global_event_receiver: event_receiver.clone().deactivate(),
             }),
         );
     }
@@ -109,18 +116,43 @@ impl GattTree {
     }
 
     /// Call this when the actual disconnection is realized.
+    ///
+    /// Returns true if the `GattConnection` is found and removed from the global
+    /// `GATT_CONNECTIONS` storage, otherwise returns false.
+    ///
+    /// If this returns true, a `ConnectionEvent::Disconnected` event will always
+    /// be produced for the device's ID.
     pub fn deregister_connection(dev_id: &DeviceId) -> bool {
-        let deregistered = GATT_CONNECTIONS.lock().unwrap().remove(dev_id);
-        if let Some(conn) = deregistered {
-            let _ = jni_with_env(|env| {
-                conn.gatt.close(env)?; // releases resources
+        let Some(conn) = GATT_CONNECTIONS.lock().unwrap().remove(&dev_id) else {
+            return false;
+        };
+        let dev_id = dev_id.clone();
+        let gatt = jni_with_env(|env| Ok(env.new_global_ref(&conn.gatt)?)).unwrap();
+        drop(conn);
+        // Releases resources by calling `BluetoothGatt.close()`.
+        if is_current_thread_main_looper().unwrap_or(false) {
+            if let Err(e) = jni_with_env(|env| Ok(gatt.close(env)?)) {
+                error!("error occurred when calling `BluetoothGatt.close()`: {e}");
+            } else {
+                info!("called `BluetoothGatt.close()` for {dev_id}");
+            }
+        } else {
+            let closing_dev_id = dev_id.clone();
+            let (tx_close, rx_close) = std::sync::mpsc::sync_channel(1);
+            let _ = post_to_main_looper(move |env| {
+                gatt.close(env)?;
+                info!("called `BluetoothGatt.close()` for {closing_dev_id}");
+                let _ = tx_close.send(());
                 Ok(())
             });
-            CONNECTION_EVENTS.notify((dev_id.clone(), ConnectionEvent::Disconnected));
-            true
-        } else {
-            false
+            if rx_close.recv_timeout(Duration::from_secs(1)).is_err() {
+                error!(
+                    "`GattTree::deregister_connection` cannot make sure to do `BluetoothGatt.close()`."
+                );
+            }
         }
+        CONNECTION_EVENTS.notify((dev_id, ConnectionEvent::Disconnected));
+        true
     }
 
     pub async fn connection_events() -> impl Stream<Item = (DeviceId, ConnectionEvent)> {
@@ -194,9 +226,9 @@ impl GattTree {
         lock_adapter: Option<&Adapter>,
         dev_id: &DeviceId,
         f: impl for<'local> FnOnce(&GattConnection, &mut Env<'local>) -> Result<R, crate::Error>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Result<R, crate::Error> {
         let adapter = lock_adapter.cloned();
         let dev_id = dev_id.clone();
@@ -243,7 +275,7 @@ impl GattConnection {
             let gatt = &self.gatt;
             let jlist_services = gatt.get_services(env)?;
             let jiter = jlist_services.iter(env)?;
-            while let Some(obj) = jiter.next(env)? {
+            while let Some(obj) = jiter.check_next(env)? {
                 let service_obj = env.cast_local::<bindings::BluetoothGattService>(obj)?;
                 let java_uuid = service_obj.get_uuid(env)?;
                 let service_id = Uuid::from_java(env, &java_uuid)?;
@@ -269,7 +301,7 @@ fn construct_service_tree<'env: 'local, 'local>(
     env.with_local_frame(32, |env| {
         let jlist_chars = service_obj.get_characteristics(env)?;
         let jiter_chars = jlist_chars.iter(env)?;
-        while let Some(obj) = jiter_chars.next(env)? {
+        while let Some(obj) = jiter_chars.check_next(env)? {
             let char_obj = env.cast_local::<bindings::BluetoothGattCharacteristic>(obj)?;
             let java_uuid = char_obj.get_uuid(env)?;
             let char_id = Uuid::from_java(env, &java_uuid)?;
@@ -278,7 +310,7 @@ fn construct_service_tree<'env: 'local, 'local>(
             env.with_local_frame(32, |env| {
                 let jlist_descs = char_obj.get_descriptors(env)?;
                 let jiter_descs = jlist_descs.iter(env)?;
-                while let Some(obj) = jiter_descs.next(env)? {
+                while let Some(obj) = jiter_descs.check_next(env)? {
                     let desc_obj = env.cast_local::<bindings::BluetoothGattDescriptor>(obj)?;
                     let java_uuid = desc_obj.get_uuid(env)?;
                     let desc_id = Uuid::from_java(env, &java_uuid)?;
@@ -484,7 +516,7 @@ impl super::callback::BluetoothGattCallbackProxy for BluetoothGattCallbackProxy 
         let _lock_gatt = env.lock_obj(gatt)?;
         let get_data = || {
             char.non_null()?
-                .as_old_api()
+                .as_old_api(env)
                 .get_value(env)?
                 .non_null()?
                 .to_vec(env)
@@ -542,7 +574,7 @@ impl super::callback::BluetoothGattCallbackProxy for BluetoothGattCallbackProxy 
         let _lock_gatt = env.lock_obj(gatt)?;
         let get_data = || {
             char.non_null()?
-                .as_old_api()
+                .as_old_api(env)
                 .get_value(env)?
                 .non_null()?
                 .to_vec(env)
@@ -589,7 +621,7 @@ impl super::callback::BluetoothGattCallbackProxy for BluetoothGattCallbackProxy 
         let _lock_gatt = env.lock_obj(gatt)?;
         let get_data = || {
             desc.non_null()?
-                .as_old_api()
+                .as_old_api(env)
                 .get_value(env)?
                 .non_null()?
                 .to_vec(env)

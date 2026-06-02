@@ -111,24 +111,27 @@ pub enum BluetoothStatusCode {
 impl std::fmt::Display for BluetoothStatusCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let err_str = match self {
-            Self::NotAllowed =>
-                "Error code indicating that the API call was initiated by neither the system nor the active user.",
-            Self::NotEnabled =>
-                "Error code indicating that Bluetooth is not enabled.",
-            Self::NotBonded =>
-                "Error code indicating that the Bluetooth Device specified is not bonded.",
-            Self::GattWriteNotAllowed =>
-                "A GATT writeCharacteristic request is not permitted on the remote device.",
-            Self::GattWriteBusy =>
-                "A GATT writeCharacteristic request is not permitted on the remote device.",
-            Self::MissingBluetoothConnectPermission =>
-                "Error code indicating that the caller does not have the Manifest.permission.BLUETOOTH_CONNECT permission.",
-            Self::ProfileServiceNotBound =>
-                "Error code indicating that the profile service is not bound.",
-            Self::Unknown =>
-                "Indicates that an unknown error has occurred.",
-            Self::FeatureNotSupported =>
-                "Indicates that the feature is not supported.",
+            Self::NotAllowed => {
+                "Error code indicating that the API call was initiated by neither the system nor the active user."
+            }
+            Self::NotEnabled => "Error code indicating that Bluetooth is not enabled.",
+            Self::NotBonded => {
+                "Error code indicating that the Bluetooth Device specified is not bonded."
+            }
+            Self::GattWriteNotAllowed => {
+                "A GATT writeCharacteristic request is not permitted on the remote device."
+            }
+            Self::GattWriteBusy => {
+                "A GATT writeCharacteristic request is not permitted on the remote device."
+            }
+            Self::MissingBluetoothConnectPermission => {
+                "Error code indicating that the caller does not have the Manifest.permission.BLUETOOTH_CONNECT permission."
+            }
+            Self::ProfileServiceNotBound => {
+                "Error code indicating that the profile service is not bound."
+            }
+            Self::Unknown => "Indicates that an unknown error has occurred.",
+            Self::FeatureNotSupported => "Indicates that the feature is not supported.",
             Self::UnknownError(code) => {
                 return f.write_str(&format!("Unknown Error with code {code}"));
             }
@@ -164,7 +167,7 @@ impl From<NonZeroI32> for BluetoothStatusCode {
 #[derive(Clone, Debug)]
 pub struct Error {
     kind: ErrorKind,
-    source: Option<NativeError>,
+    pub(super) source: Option<NativeError>,
     message: String,
 }
 

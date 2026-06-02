@@ -1,13 +1,12 @@
-use jni::objects::{JByteArray, JThread};
 use jni::Env;
+use jni::objects::{JByteArray, JIterator, JObject, JThread};
 use std::num::NonZeroI32;
 use std::sync::OnceLock;
 
 use crate::{
-    bindings,
-    error::{BluetoothStatusCode, Error, ErrorKind, NativeError},
+    DeviceId, bindings,
+    error::{BluetoothStatusCode, ErrorKind, NativeError},
     gatt_tree::GattTree,
-    DeviceId,
 };
 
 pub(crate) use jni_min_helper::android_api_level;
@@ -71,10 +70,33 @@ mod unsafe_cached_weak {
     }
 }
 
+/// Alternative for `jni_min_helper::jni_with_env` that deals with `crate::Error`.
+/// This is responsible for catching pending Java exception on `NativeError::JavaError`.
+///
+/// Note that if `f` returns the error with inner `JavaError`, it's usually converted
+/// by the simple `impl From<jni::errors::Error> for NativeError`, such convertion
+/// is usually done before catching the exception, and that `from` function has no
+/// cheaply available `env` for getting the exception info. If needed in the future,
+/// the better exception-to-error convertion can be implemented as a subroutine
+/// of this function.
 #[inline(always)]
-pub(crate) fn jni_with_env<R>(f: impl FnOnce(&mut Env) -> Result<R, Error>) -> Result<R, Error> {
+pub(crate) fn jni_with_env<R>(
+    f: impl FnOnce(&mut Env) -> Result<R, crate::Error>,
+) -> Result<R, crate::Error> {
     let vm = jni_min_helper::jni_get_vm();
-    vm.attach_current_thread(|env| Ok::<_, jni::errors::Error>(f(env)))?
+    vm.attach_current_thread(|env| match f(env) {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            if let Some(native) = e.source.as_ref()
+                && matches!(native, NativeError::JavaError(_))
+                && let Err(ex) = env.exception_catch()
+                && matches!(e.kind(), ErrorKind::Internal | ErrorKind::Other)
+            {
+                return Err(ex.into());
+            }
+            Err(e)
+        }
+    })
 }
 
 pub(crate) fn android_context<'local>(
@@ -112,12 +134,36 @@ pub(crate) fn is_current_thread_main_looper() -> Result<bool, jni::errors::Error
             Ok(())
         })?;
     }
+    let cur_id = current_java_thread_id()?;
+    Ok(cur_id == *MAIN_LOOPER_TID.get().unwrap())
+}
+
+pub(crate) fn current_java_thread_id() -> Result<i64, jni::errors::Error> {
     jni_min_helper::jni_with_env(|env| {
         let current_thread = JThread::current_thread(env)?;
-        // XXX: `getId` is deprecated on newest platform:
-        // <https://github.com/jni-rs/jni-rs/issues/826>
-        Ok(&current_thread.get_id(env)? == MAIN_LOOPER_TID.get().unwrap())
+        current_thread.get_id(env)
     })
+}
+
+/// Workaround for <https://github.com/jni-rs/jni-rs/issues/827>.
+/// Use this instead of the original `JIterator::next` before that issue is resolved.
+pub trait JIteratorExt {
+    fn check_next<'local>(
+        &self,
+        env: &mut Env<'local>,
+    ) -> Result<Option<JObject<'local>>, jni::errors::Error>;
+}
+
+impl<'local> JIteratorExt for JIterator<'local> {
+    fn check_next<'env_local>(
+        &self,
+        env: &mut Env<'env_local>,
+    ) -> Result<Option<JObject<'env_local>>, jni::errors::Error> {
+        if !self.has_next(env)? {
+            return Ok(None);
+        }
+        self.next(env)
+    }
 }
 
 pub trait JByteArrayExt {
@@ -209,11 +255,7 @@ impl<T: jni::refs::Reference> ReferenceExt<T> for T {
         }
     }
     fn to_option(self) -> Option<T> {
-        if self.is_null() {
-            None
-        } else {
-            Some(self)
-        }
+        if self.is_null() { None } else { Some(self) }
     }
 }
 

@@ -3,19 +3,20 @@ use std::{collections::HashMap, sync::Arc};
 
 use futures_core::Stream;
 use jni::{
-    jni_sig, jni_str,
+    Env, jni_sig, jni_str,
     objects::{JByteArray, JList, JMapEntry, JString},
     refs::Global,
-    Env,
 };
 use log::{debug, warn};
 use uuid::Uuid;
 
 use crate::async_util::StreamUntil;
 use crate::event_receiver::{EventReceiver, GlobalEvent};
-use crate::util::{android_api_level, jni_with_env, JByteArrayExt, ReferenceExt, UuidExt};
+use crate::util::{
+    JByteArrayExt, JIteratorExt, ReferenceExt, UuidExt, android_api_level, jni_with_env,
+};
 use crate::{
-    bindings, callback, AdvertisementData, AdvertisingDevice, Device, ManufacturerData, Result,
+    AdvertisementData, AdvertisingDevice, Device, ManufacturerData, Result, bindings, callback,
 };
 
 pub struct Scanner {
@@ -106,7 +107,7 @@ impl Scanner {
                     crate::error::ErrorKind::Internal,
                     None,
                     format!("receiving failed while waiting for start: {e:?}"),
-                ))
+                ));
             }
         }
         Ok(scanner)
@@ -183,7 +184,7 @@ impl super::callback::ScanCallbackProxy for ScanCallbackProxy {
             format!("Scan failed to start with error code {error_code}"),
         );
         if let Err(e) = self.start_sender.try_send(Err(e)) {
-            warn!("onScanFailed failed to send error: {e:?}");
+            warn!("`on_scan_failed` failed to send error: {e:?}");
         }
         Ok(())
     }
@@ -194,11 +195,11 @@ impl super::callback::ScanCallbackProxy for ScanCallbackProxy {
         scan_results: JList<'local>,
     ) -> Result<(), jni::errors::Error> {
         let Some(scan_results) = scan_results.to_option() else {
-            warn!("onBatchScanResults: ignoring null scan_results");
+            warn!("`on_batch_scan_results`: ignoring null scan_results");
             return Ok(());
         };
         if let Some(jiter_results) = scan_results.iter(env)?.to_option() {
-            while let Some(scan_result) = jiter_results.next(env)? {
+            while let Some(scan_result) = jiter_results.check_next(env)? {
                 let scan_result = env.cast_local::<bindings::ScanResult>(scan_result)?;
                 self.on_scan_result(env, 0, scan_result)?; // NOTE: this `0` is meaningless!
             }
@@ -213,7 +214,7 @@ impl super::callback::ScanCallbackProxy for ScanCallbackProxy {
         scan_result: bindings::ScanResult<'local>,
     ) -> Result<(), jni::errors::Error> {
         let Some(scan_result) = scan_result.to_option() else {
-            warn!("onScanResult: ignoring null scan_result");
+            warn!("`on_scan_result`: ignoring null scan_result");
             return Ok(());
         };
 
@@ -244,7 +245,7 @@ impl super::callback::ScanCallbackProxy for ScanCallbackProxy {
         if !jlist_serv_uuids.is_null() {
             env.with_local_frame(32, |env| {
                 let jiter_serv_uuids = jlist_serv_uuids.iter(env)?;
-                while let Some(parcel_uuid) = jiter_serv_uuids.next(env)? {
+                while let Some(parcel_uuid) = jiter_serv_uuids.check_next(env)? {
                     let parcel_uuid = env.as_cast::<bindings::ParcelUuid>(&parcel_uuid)?;
                     if let Ok(uuid) = Uuid::from_andriod_parcel(env, &parcel_uuid) {
                         services.push(uuid);
@@ -256,11 +257,11 @@ impl super::callback::ScanCallbackProxy for ScanCallbackProxy {
 
         // Service data
         let mut service_data = HashMap::new();
-        let sd = scan_record.get_service_data(env)?;
-        let sd = sd.entry_set(env)?;
-        let jiter_sd = sd.iterator(env)?;
+        let jmap_sd = scan_record.get_service_data(env)?;
+        let jentryset_sd = jmap_sd.entry_set(env)?;
+        let jiter_sd = jentryset_sd.iterator(env)?;
         env.with_local_frame(32, |env| {
-            while let Some(entry) = jiter_sd.next(env)? {
+            while let Some(entry) = jiter_sd.check_next(env)? {
                 let entry = env.cast_local::<JMapEntry>(entry)?;
                 let (key, val) = (entry.key(env)?, entry.value(env)?);
                 let (key, val) = (
@@ -279,7 +280,7 @@ impl super::callback::ScanCallbackProxy for ScanCallbackProxy {
         let msd = scan_record.get_manufacturer_specific_data(env)?;
         // XXX: there can be multiple manufacturer data entries, but the API (compatible with bluest)
         // only supports one. So grab just the first.
-        if msd.size(env)? != 0 {
+        if msd.size(env)? > 0 {
             let jarr_msd = msd.value_at(env, 0)?;
             let jarr_msd = env.cast_local::<JByteArray>(jarr_msd)?;
             manufacturer_data = Some(ManufacturerData {
