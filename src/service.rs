@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::characteristic::Characteristic;
 use crate::gatt_tree::{GattTree, ServiceInner};
 use crate::util::{CachedWeak, JIteratorExt, OptionExt, UuidExt, jni_with_env};
-use crate::{DeviceId, Result, Uuid, bindings};
+use crate::{DeviceId, Result, Uuid, bindings, error::ErrorKind};
 
 /// A Bluetooth GATT service.
 #[derive(Debug, Clone)]
@@ -124,7 +124,8 @@ impl Service {
 
     fn get_inner(&self) -> Result<Arc<ServiceInner>, crate::Error> {
         self.inner.get_or_find(|| {
-            GattTree::find_service(&self.dev_id, self.service_id).ok_or_check_conn(&self.dev_id)
+            GattTree::find_service(&self.dev_id, self.service_id)
+                .ok_or_check_conn(&self.dev_id, ErrorKind::ServiceChanged)
         })
     }
 }

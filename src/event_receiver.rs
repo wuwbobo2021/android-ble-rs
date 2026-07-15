@@ -1,15 +1,15 @@
 use std::ops::Deref;
 use std::sync::OnceLock;
 
-use jni::{objects::JString, refs::Reference, Env};
+use jni::{Env, objects::JString, refs::Reference};
 use jni_min_helper::{BroadcastReceiver, Intent, IntentFilter};
 use log::{error, info};
 
+use crate::DeviceId;
 use crate::async_util::{Notifier, NotifierReceiver};
 use crate::bindings;
 use crate::gatt_tree::GattTree;
-use crate::util::{android_api_level, jni_with_env, ReferenceExt};
-use crate::DeviceId;
+use crate::util::{ReferenceExt, android_api_level, jni_with_env};
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq)]

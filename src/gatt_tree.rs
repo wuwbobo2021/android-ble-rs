@@ -123,7 +123,7 @@ impl GattTree {
     /// If this returns true, a `ConnectionEvent::Disconnected` event will always
     /// be produced for the device's ID.
     pub fn deregister_connection(dev_id: &DeviceId) -> bool {
-        let Some(conn) = GATT_CONNECTIONS.lock().unwrap().remove(&dev_id) else {
+        let Some(conn) = GATT_CONNECTIONS.lock().unwrap().remove(dev_id) else {
             return false;
         };
         let dev_id = dev_id.clone();

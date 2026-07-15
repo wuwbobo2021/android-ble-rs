@@ -165,7 +165,10 @@ impl Device {
         })
         .await?;
         drop(conn);
-        disc_lock.wait_unlock().await.ok_or_check_conn(&self.id)??;
+        disc_lock
+            .wait_unlock()
+            .await
+            .ok_or_check_conn(&self.id, ErrorKind::Timeout)??;
         self.collect_discovered_services()
     }
 
@@ -239,7 +242,7 @@ impl Device {
         read_rssi_lock
             .wait_unlock()
             .await
-            .ok_or_check_conn(&self.id)?
+            .ok_or_check_conn(&self.id, ErrorKind::Timeout)?
     }
 
     /// (**Experimental**) Open an L2CAP connection-oriented channel (CoC) to this device.

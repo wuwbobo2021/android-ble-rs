@@ -1,6 +1,8 @@
 use jni::Env;
 use jni::objects::{JByteArray, JIterator, JObject, JThread};
+use log::error;
 use std::num::NonZeroI32;
+use std::panic;
 use std::sync::OnceLock;
 
 use crate::{
@@ -238,8 +240,6 @@ impl UuidExt for uuid::Uuid {
     }
 }
 
-// TODO: make use of the caller information in these track caller methods below.
-
 pub(crate) trait ReferenceExt<T> {
     fn non_null(self) -> Result<T, jni::errors::Error>;
     fn to_option(self) -> Option<T>;
@@ -249,6 +249,8 @@ impl<T: jni::refs::Reference> ReferenceExt<T> for T {
     #[track_caller]
     fn non_null(self) -> Result<T, jni::errors::Error> {
         if self.is_null() {
+            let loc = panic::Location::caller();
+            error!("non-null check at {}:{} failed", loc.file(), loc.line());
             Err(jni::errors::Error::NullPtr("unexpected null value"))
         } else {
             Ok(self)
@@ -260,31 +262,64 @@ impl<T: jni::refs::Reference> ReferenceExt<T> for T {
 }
 
 pub(crate) trait OptionExt<T> {
-    fn ok_or_check_conn(self, dev_id: &DeviceId) -> Result<T, crate::Error>;
+    /// Turns `Some` into `Ok`; with a `None` input, this checks the connection of device
+    /// with `dev_id`, returns error of `ErrorKind::NotConnected` if it is disconnected,
+    /// or an error of kind `err_if_connected` if it is still connected.
+    fn ok_or_check_conn(
+        self,
+        dev_id: &DeviceId,
+        err_if_connected: ErrorKind,
+    ) -> Result<T, crate::Error>;
 }
 
 impl<T> OptionExt<T> for Option<T> {
     #[track_caller]
-    fn ok_or_check_conn(self, dev_id: &DeviceId) -> Result<T, crate::Error> {
+    fn ok_or_check_conn(
+        self,
+        dev_id: &DeviceId,
+        err_if_connected: ErrorKind,
+    ) -> Result<T, crate::Error> {
+        let loc = panic::Location::caller();
         self.ok_or_else(|| {
             if GattTree::find_connection(dev_id).is_none() {
+                error!(
+                    "disconnection of {dev_id} realized at {}:{}",
+                    loc.file(),
+                    loc.line()
+                );
                 ErrorKind::NotConnected.into()
             } else {
-                ErrorKind::ServiceChanged.into()
+                error!(
+                    "error {err_if_connected:?} produced at {}:{}",
+                    loc.file(),
+                    loc.line()
+                );
+                err_if_connected.into()
             }
         })
     }
 }
 
 pub(crate) trait BoolExt {
+    /// Call this right after calling a Java method that simply returns false
+    /// for some errors.
     fn non_false(self) -> Result<(), crate::Error>;
 }
 
 impl BoolExt for bool {
     #[track_caller]
     fn non_false(self) -> Result<(), crate::Error> {
-        self.then_some(())
-            .ok_or_else(|| NativeError::JavaCallReturnedFalse.into())
+        if self {
+            Ok(())
+        } else {
+            let loc = panic::Location::caller();
+            error!(
+                "JNI Java call at {}:{} returned false",
+                loc.file(),
+                loc.line()
+            );
+            Err(NativeError::JavaCallReturnedFalse.into())
+        }
     }
 }
 

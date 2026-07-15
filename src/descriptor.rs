@@ -4,7 +4,7 @@ use jni::objects::JByteArray;
 
 use crate::error::ErrorKind;
 use crate::gatt_tree::{DescriptorInner, GattTree};
-use crate::util::{android_api_level, BoolExt, CachedWeak, IntExt, JByteArrayExt, OptionExt};
+use crate::util::{BoolExt, CachedWeak, IntExt, JByteArrayExt, OptionExt, android_api_level};
 use crate::{DeviceId, Result, Uuid};
 
 /// A Bluetooth GATT descriptor.
@@ -79,7 +79,7 @@ impl Descriptor {
         read_lock
             .wait_unlock()
             .await
-            .ok_or_check_conn(&self.dev_id)?
+            .ok_or_check_conn(&self.dev_id, ErrorKind::Timeout)?
     }
 
     /// Write the `value` to this descriptor on the device.
@@ -109,13 +109,13 @@ impl Descriptor {
         write_lock
             .wait_unlock()
             .await
-            .ok_or_check_conn(&self.dev_id)?
+            .ok_or_check_conn(&self.dev_id, ErrorKind::Timeout)?
     }
 
     fn get_inner(&self) -> Result<Arc<DescriptorInner>, crate::Error> {
         self.inner.get_or_find(|| {
             GattTree::find_descriptor(&self.dev_id, self.service_id, self.char_id, self.desc_id)
-                .ok_or_check_conn(&self.dev_id)
+                .ok_or_check_conn(&self.dev_id, ErrorKind::ServiceChanged)
         })
     }
 }

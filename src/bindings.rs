@@ -530,6 +530,18 @@ bind_java_type! {
         non_null fn get_uuid() -> UUID,
         non_null fn get_characteristic() -> BluetoothGattCharacteristic,
     },
+    fields {
+        #[allow(non_snake_case)]
+        static ENABLE_INDICATION_VALUE {
+            sig = jbyte[],
+            get = ENABLE_INDICATION_VALUE,
+        },
+        #[allow(non_snake_case)]
+        static ENABLE_NOTIFICATION_VALUE {
+            sig = jbyte[],
+            get = ENABLE_NOTIFICATION_VALUE,
+        },
+    }
 }
 
 // XXX

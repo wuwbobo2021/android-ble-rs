@@ -370,7 +370,7 @@ impl Adapter {
             Ok(conn.gatt.disconnect(env)?)
         })
         .await?;
-        let mut conn_events = self.device_connection_events(&device).await?;
+        let mut conn_events = self.device_connection_events(device).await?;
         if GattTree::deregister_connection(&device.id()) {
             while let Some(event) = conn_events.next().await {
                 if event == ConnectionEvent::Disconnected {

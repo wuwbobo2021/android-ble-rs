@@ -4,13 +4,14 @@ use futures_core::Stream;
 use jni::objects::JByteArray;
 use uuid::Uuid;
 
-use crate::bindings::{self, BluetoothGattCharacteristic};
+use crate::bindings::{self, BluetoothGattCharacteristic, BluetoothGattDescriptor};
+use crate::btuuid::descriptors::CLIENT_CHARACTERISTIC_CONFIGURATION;
 use crate::descriptor::Descriptor;
 use crate::error::ErrorKind;
 use crate::gatt_tree::{CharacteristicInner, GattTree};
 use crate::util::{
-    android_api_level, jni_with_env, post_to_main_looper, BoolExt, CachedWeak, IntExt,
-    JByteArrayExt, OptionExt,
+    BoolExt, CachedWeak, IntExt, JByteArrayExt, OptionExt, android_api_level, jni_with_env,
+    post_to_main_looper,
 };
 use crate::{CharacteristicProperties, DeviceId, Result};
 
@@ -105,7 +106,7 @@ impl Characteristic {
         read_lock
             .wait_unlock()
             .await
-            .ok_or_check_conn(&self.dev_id)?
+            .ok_or_check_conn(&self.dev_id, ErrorKind::Timeout)?
     }
 
     /// Write `value` to this characteristic on the device and request the device to return a response
@@ -167,7 +168,7 @@ impl Characteristic {
         write_lock
             .wait_unlock()
             .await
-            .ok_or_check_conn(&self.dev_id)?
+            .ok_or_check_conn(&self.dev_id, ErrorKind::Timeout)?
     }
 
     /// Get the maximum amount of data that can be written in a single packet for this characteristic.
@@ -191,9 +192,47 @@ impl Characteristic {
     ///
     /// Returns a stream of values for the characteristic sent from the device.
     pub async fn notify(&self) -> Result<impl Stream<Item = Result<Vec<u8>>> + Send + Unpin + '_> {
+        let (is_notify, is_indicate) = self
+            .properties()
+            .await
+            .map(|prop| (prop.notify, prop.indicate))?;
+        if !is_notify && !is_indicate {
+            return Err(crate::Error::new(
+                ErrorKind::NotSupported,
+                None,
+                "Characteristic {} doesn't support notification",
+            ));
+        }
+
         let conn = GattTree::check_connection(&self.dev_id)?;
         let inner = self.get_inner()?;
         let inner_2 = inner.clone();
+
+        if !inner.notify.is_notifying()
+            && let Some(cccd) = self
+                .descriptors()
+                .await?
+                .into_iter()
+                .find(|d| d.uuid() == CLIENT_CHARACTERISTIC_CONFIGURATION)
+        {
+            let cccd_start_notify = jni_with_env(|env| {
+                let val = if is_indicate {
+                    BluetoothGattDescriptor::ENABLE_INDICATION_VALUE(env)
+                } else {
+                    BluetoothGattDescriptor::ENABLE_NOTIFICATION_VALUE(env)
+                }?
+                .to_vec(env)?;
+                Ok(val)
+            })?;
+            cccd.write(&cccd_start_notify).await.map_err(|e| {
+                crate::Error::new(
+                    ErrorKind::Internal,
+                    e.source,
+                    "Failed to enable notification/indication in CCCD",
+                )
+            })?;
+        }
+
         // NOTE: This is a workaround; using tuple instead of this struct triggers something like
         // <https://github.com/jni-rs/jni-rs/issues/782>, which is probably related to a Rust bug.
         struct ResOnStop {
@@ -205,6 +244,7 @@ impl Characteristic {
             let char = env.new_global_ref(&inner.char)?;
             Ok(ResOnStop { gatt, char })
         })?;
+
         inner
             .notify
             .subscribe(
@@ -222,6 +262,7 @@ impl Characteristic {
                             &res_on_stop.char,
                             false,
                         )?;
+                        // XXX: should CCCD be written here? that may affect other applications.
                         Ok(())
                     });
                 },
@@ -252,7 +293,7 @@ impl Characteristic {
     fn get_inner(&self) -> Result<Arc<CharacteristicInner>, crate::Error> {
         self.inner.get_or_find(|| {
             GattTree::find_characteristic(&self.dev_id, self.service_id, self.char_id)
-                .ok_or_check_conn(&self.dev_id)
+                .ok_or_check_conn(&self.dev_id, ErrorKind::ServiceChanged)
         })
     }
 }

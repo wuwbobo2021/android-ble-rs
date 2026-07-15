@@ -1,5 +1,10 @@
 # Changes
 
+## 0.2.1
+* `Characteristic::notify` now enables notification in CCCD. Note that the CCCD is currently untouched when the notification stream is being dropped, this avoids affecting other applications.
+* Reduced false `ServiceChanged` errors (usually timeout, because real service change events are rare). Note: better improvement is still possible, probably involving changing the return type of `async_util::ResultWaiter::wait_unlock`.
+* Improved error tracing.
+
 ## 0.2.0
 * Bumped `jni` to 0.22.4, removed workarounds for `java-spaghetti` 0.2.0; reduced `unsafe` usages.
 * All GATT operations are now posted to the Android main looper.
