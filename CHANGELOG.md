@@ -1,5 +1,8 @@
 # Changes
 
+## 0.2.2
+* Bumped `jni-min-helper` to 0.4.5, removing the workaround for `post_to_main_looper`.
+
 ## 0.2.1
 * `Characteristic::notify` now enables notification in CCCD. Note that the CCCD is currently untouched when the notification stream is being dropped, this avoids affecting other applications.
 * Reduced false `ServiceChanged` errors (usually timeout, because real service change events are rare). Note: better improvement is still possible, probably involving changing the return type of `async_util::ResultWaiter::wait_unlock`.

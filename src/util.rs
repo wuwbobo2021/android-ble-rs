@@ -112,18 +112,10 @@ pub(crate) fn android_has_permission(permission: &str) -> Result<bool, jni::erro
     jni_min_helper::PermissionRequest::has_permission(permission)
 }
 
-// This is a workaround for `jni_min_helper`'s `post_to_main_looper` which doesn't support `FnOnce`.
 pub(crate) fn post_to_main_looper(
     runnable: impl FnOnce(&mut jni::Env) -> Result<(), jni::errors::Error> + Send + Sync + 'static,
 ) -> Result<bool, jni::errors::Error> {
-    let runnable = std::sync::Mutex::new(Some(runnable));
-    jni_min_helper::DynamicProxy::post_to_main_looper(move |env| {
-        if let Some(runnable) = runnable.lock().unwrap().take() {
-            runnable(env)
-        } else {
-            Ok(())
-        }
-    })
+    jni_min_helper::DynamicProxy::post_to_main_looper(runnable)
 }
 
 pub(crate) fn is_current_thread_main_looper() -> Result<bool, jni::errors::Error> {
